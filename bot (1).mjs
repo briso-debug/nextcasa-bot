@@ -23,7 +23,7 @@ const CONFIG = {
   // Compte Facebook dédié
   facebook: {
     email: 'nextcasa.fb@gmail.com',
-    password: process.env.FB_PASSWORD || 'XXX',
+    password: process.env.FB_PASSWORD || 'Nextcasa$$26$',
     sessionFile: path.join(__dirname, 'data', 'fb_session.json'),
   },
 
