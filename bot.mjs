@@ -1,10 +1,6 @@
 /**
- * bot.mjs — NextCasa v6
- * Sources: Anibis (3 pages) · ImmoScout24 (par quartier) · PetitesAnnonces · Rentola
- * - Filtre 2 jours
- * - Dédoublonnage URL + prix/pièces
- * - Ouvre annonce si infos manquantes
- * - 1h/jour · 2h/nuit
+ * bot.mjs — NextCasa v7
+ * Corrections: networkidle→domcontentloaded, max passé correctement, ImmoScout robuste
  */
 
 import { chromium } from 'playwright';
@@ -17,12 +13,10 @@ import 'dotenv/config';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CONFIG = {
+  maxPerPage: 30,
   sources: [
-    // ── ANIBIS 3 pages ──────────────────────────────────────────
     {
-      id: 'anibis',
-      name: 'Anibis.ch',
-      type: 'anibis',
+      id: 'anibis', name: 'Anibis.ch', type: 'anibis',
       pages: [
         'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-maisons-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZZKpYXBhcnRtZW50pWhvdXNlkqlwcmljZVR5cGWkUkVOVMDAkZOobG9jYXRpb26xZ2VvLWNhbnRvbi1nZW5ldmXA?sorting=newest&page=1',
         'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-maisons-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZZKpYXBhcnRtZW50pWhvdXNlkqlwcmljZVR5cGWkUkVOVMDAkZOobG9jYXRpb26xZ2VvLWNhbnRvbi1nZW5ldmXA?sorting=newest&page=2',
@@ -30,11 +24,8 @@ const CONFIG = {
       ],
       waitFor: 5000,
     },
-    // ── IMMOSCOUT par quartier (évite le problème React SPA) ────
     {
-      id: 'immoscout',
-      name: 'ImmoScout24.ch',
-      type: 'immoscout',
+      id: 'immoscout', name: 'ImmoScout24.ch', type: 'immoscout',
       pages: [
         'https://www.immoscout24.ch/fr/appartement/louer/canton-geneve',
         'https://www.immoscout24.ch/fr/appartement/louer/canton-geneve?pn=2',
@@ -42,21 +33,13 @@ const CONFIG = {
       ],
       waitFor: 8000,
     },
-    // ── PETITES ANNONCES ────────────────────────────────────────
     {
-      id: 'petitesannonces',
-      name: 'PetitesAnnonces.ch',
-      type: 'generic',
-      pages: [
-        'https://www.petitesannonces.ch/r/270608?od=desc&ob=submissionDate',
-      ],
+      id: 'petitesannonces', name: 'PetitesAnnonces.ch', type: 'generic',
+      pages: ['https://www.petitesannonces.ch/r/270608?od=desc&ob=submissionDate'],
       waitFor: 3000,
     },
-    // ── RENTOLA ─────────────────────────────────────────────────
     {
-      id: 'rentola',
-      name: 'Rentola.ch',
-      type: 'generic',
+      id: 'rentola', name: 'Rentola.ch', type: 'generic',
       pages: [
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment',
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment&page=2',
@@ -65,8 +48,6 @@ const CONFIG = {
       waitFor: 4000,
     },
   ],
-
-  maxAgeDays: 2,
   schedule: {
     dayStart: 6, dayEnd: 24,
     dayInterval: 60 * 60 * 1000,
@@ -74,20 +55,13 @@ const CONFIG = {
   },
   minConfidence: 40,
   expiryDays: 14,
-  maxPerPage: 30,
-
-  closedKeywords: [
-    'trouvé preneur', 'trouve preneur', "c'est pris", 'plus disponible',
-    'loué', 'bail signé', 'merci à tous', 'found someone', 'taken',
-  ],
-
   dataFile: path.join(__dirname, 'data', 'listings.json'),
   seenFile: path.join(__dirname, 'data', 'seen.json'),
   logFile: path.join(__dirname, 'data', 'bot.log'),
 };
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min) + min);
 
 function loadJSON(f, fb) { try { if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf8')); } catch {} return fb; }
@@ -118,101 +92,137 @@ function isDuplicate(listing, existing) {
 }
 
 async function acceptCookies(page) {
-  const btns = ['button:has-text("Tout accepter")', 'button:has-text("Accepter tout")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]'];
-  for (const btn of btns) {
-    try { await page.click(btn, { timeout: 2000 }); await sleep(600); break; } catch {}
+  for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]']) {
+    try { await page.click(sel, { timeout: 2000 }); await sleep(500); break; } catch {}
+  }
+}
+
+async function scroll(page, times) {
+  for (let i = 0; i < times; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await sleep(800);
   }
 }
 
 // ── ANIBIS ──────────────────────────────────────────────────────────
-async function scrapeAnibis(page, url, waitFor) {
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
-  await sleep(waitFor);
-  await acceptCookies(page);
-  for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(700); }
-
-  const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
-  log(`    ${info.title} · ${info.len} chars`);
-
-  return page.evaluate((max) => {
-    const results = [];
-    const links = Array.from(document.querySelectorAll('a[href*="/vi/"]'));
-    const seen = new Set();
-    links.forEach(a => {
-      if (seen.has(a.href)) return; seen.add(a.href);
-      let el = a;
-      for (let i = 0; i < 5; i++) {
-        if (el.parentElement?.innerText?.length > 80 && el.parentElement?.innerText?.length < 2000) el = el.parentElement;
-        else break;
-      }
-      const text = el.innerText?.trim() || '';
-      const textL = text.toLowerCase();
-      // Filtre 2 jours
-      const dayMatch = textL.match(/(\d+)\s*(?:jour|day)/);
-      if (dayMatch && parseInt(dayMatch[1]) > 2) return;
-      const img = el.querySelector('img[src*="http"]')?.src || '';
-      if (text.length > 40 && results.length < max) results.push({ text: text.substring(0, 800), link: a.href, img });
-    });
-    return results;
-  }, CONFIG.maxPerPage);
-}
-
-// ── IMMOSCOUT ────────────────────────────────────────────────────────
-// Stratégie: charger la page, attendre JS, extraire les liens d'annonces
-// puis visiter chaque annonce individuellement pour le texte complet
-async function scrapeImmoScout(page, url, waitFor) {
+async function scrapeAnibis(page, url, waitFor, maxPerPage) {
+  // Utiliser domcontentloaded au lieu de networkidle pour éviter le timeout
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await sleep(waitFor);
   await acceptCookies(page);
-
-  // Scroll agressif pour forcer le chargement React
-  for (let i = 0; i < 6; i++) {
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-    await sleep(1200);
-  }
+  await scroll(page, 4);
 
   const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
   log(`    ${info.title} · ${info.len} chars`);
 
-  // Extraire les liens d'annonces ImmoScout
-  const links = await page.evaluate(() => {
-    const seen = new Set();
+  // Extraire les blocs d'annonces via les liens /vi/
+  const items = await page.evaluate((max) => {
     const results = [];
-    // ImmoScout: liens avec /fr/ et des chiffres (IDs annonces)
-    document.querySelectorAll('a[href]').forEach(a => {
-      const h = a.href;
-      if (!h.includes('immoscout24.ch')) return;
-      if (!h.match(/\/\d{7,}/)) return;
-      if (seen.has(h)) return;
-      seen.add(h);
-      // Prendre le bloc parent pour avoir le texte et l'image
+    const seen = new Set();
+    const links = Array.from(document.querySelectorAll('a[href*="/vi/"]'));
+    links.forEach(a => {
+      if (seen.has(a.href) || !a.href) return;
+      seen.add(a.href);
       let el = a;
       for (let i = 0; i < 5; i++) {
-        if (el.parentElement?.innerText?.length > 60 && el.parentElement?.innerText?.length < 3000) el = el.parentElement;
-        else break;
+        if (el.parentElement?.innerText?.length > 80 && el.parentElement?.innerText?.length < 2000) {
+          el = el.parentElement;
+        } else break;
+      }
+      const text = el.innerText?.trim() || '';
+      // Filtre 2 jours
+      const dayMatch = text.toLowerCase().match(/(\d+)\s*(?:jour|day)/);
+      if (dayMatch && parseInt(dayMatch[1]) > 2) return;
+      const img = el.querySelector('img[src*="http"]')?.src || '';
+      if (text.length > 40 && results.length < max) {
+        results.push({ text: text.substring(0, 800), link: a.href, img });
+      }
+    });
+    return results;
+  }, maxPerPage);
+
+  log(`    ${items.length} items`);
+  return items;
+}
+
+// ── IMMOSCOUT ────────────────────────────────────────────────────────
+// ImmoScout bloque le headless browser → on utilise une approche différente:
+// charger la page, attendre longuement, prendre tout le texte brut visible
+async function scrapeImmoScout(page, url, waitFor, maxPerPage) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
+  } catch (e) {
+    log(`    ⚠ Goto partiel: ${e.message.substring(0, 50)}`);
+  }
+
+  // Attendre très longuement + scroll pour forcer React
+  await sleep(waitFor);
+  await acceptCookies(page);
+  await scroll(page, 8);
+  await sleep(2000);
+
+  const info = await page.evaluate(() => ({
+    title: document.title.substring(0, 60),
+    len: document.body.innerText.length,
+    html: document.body.innerHTML.length,
+  }));
+  log(`    ${info.title} · ${info.len} chars text · ${info.html} chars html`);
+
+  if (info.len < 200) {
+    log(`    ⚠ ImmoScout bloqué (page vide) — skip`);
+    return [];
+  }
+
+  // Extraire les annonces
+  const items = await page.evaluate((max) => {
+    const results = [];
+    const seen = new Set();
+
+    // Chercher les liens avec des IDs d'annonces (chiffres longs)
+    const allLinks = Array.from(document.querySelectorAll('a[href]'));
+    const adLinks = allLinks.filter(a => {
+      const h = a.href || '';
+      return h.includes('immoscout24') && h.match(/\/\d{7,}/) && !seen.has(h);
+    });
+
+    adLinks.slice(0, max).forEach(a => {
+      seen.add(a.href);
+      let el = a;
+      for (let i = 0; i < 6; i++) {
+        if (el.parentElement?.innerText?.length > 60 && el.parentElement?.innerText?.length < 3000) {
+          el = el.parentElement;
+        } else break;
       }
       const text = el.innerText?.trim() || a.innerText?.trim() || '';
       const img = el.querySelector('img[src*="http"]')?.src || '';
-      results.push({ text: text.substring(0, 800), link: h, img });
+      if (text.length > 20) results.push({ text: text.substring(0, 800), link: a.href, img });
     });
-    return results.slice(0, 30);
-  });
 
-  log(`    ${links.length} annonces trouvées`);
-  return links;
+    // Fallback si pas de liens trouvés: extraire le texte brut en blocs
+    if (results.length === 0) {
+      const bodyText = document.body.innerText;
+      const blocks = bodyText.split(/\n{3,}/).filter(b => b.trim().length > 60);
+      blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
+    }
+
+    return results;
+  }, maxPerPage);
+
+  log(`    ${items.length} items`);
+  return items;
 }
 
-// ── GÉNÉRIQUE (PetitesAnnonces, Rentola) ─────────────────────────────
-async function scrapeGeneric(page, url, waitFor) {
+// ── GÉNÉRIQUE ────────────────────────────────────────────────────────
+async function scrapeGeneric(page, url, waitFor, maxPerPage) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
   await acceptCookies(page);
-  for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(800); }
+  await scroll(page, 3);
 
   const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
   log(`    ${info.title} · ${info.len} chars`);
 
-  return page.evaluate((max) => {
+  const items = await page.evaluate((maxItems) => {
     const results = [];
     const selectors = ['[class*="listing"]', '[class*="result"]', '[class*="card"]', '[class*="property"]', 'article', 'li[class]'];
     let cards = [];
@@ -220,14 +230,15 @@ async function scrapeGeneric(page, url, waitFor) {
       cards = Array.from(document.querySelectorAll(sel)).filter(el => el.innerText?.length > 40 && el.innerText?.length < 3000);
       if (cards.length > 3) break;
     }
+
     if (cards.length === 0) {
-      // Fallback texte brut
       const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 40);
-      blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
+      blocks.slice(0, maxItems).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
       return results;
     }
+
     const seen = new Set();
-    cards.slice(0, max).forEach(card => {
+    cards.slice(0, maxItems).forEach(card => {
       const link = card.querySelector('a[href]')?.href || '';
       if (seen.has(link) && link) return;
       if (link) seen.add(link);
@@ -236,15 +247,18 @@ async function scrapeGeneric(page, url, waitFor) {
       if (text.length > 40) results.push({ text: text.substring(0, 600), link, img });
     });
     return results;
-  }, max);
+  }, maxPerPage);
+
+  log(`    ${items.length} items`);
+  return items;
 }
 
-// ── ENRICHISSEMENT page détail ───────────────────────────────────────
+// ── ENRICHISSEMENT ───────────────────────────────────────────────────
 async function enrichDetail(page, url) {
   if (!url?.startsWith('http')) return null;
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await sleep(2000);
+    await sleep(1500);
     const text = await page.evaluate(() => document.body.innerText?.trim().substring(0, 1000) || '');
     const img = await page.evaluate(() => {
       const imgs = Array.from(document.querySelectorAll('img[src*="http"]')).filter(i => i.width > 150);
@@ -260,9 +274,7 @@ async function extractWithLLM(text, sourceName) {
   const prompt = `Extracteur annonces immobilières Genève. Source: ${sourceName}
 Texte: ${clean}
 
-JSON une ligne uniquement. Si pas offre location GE canton → type ignorer.
-Info manquante → null.
-
+Réponds en JSON une ligne. Si pas offre location canton GE → type ignorer.
 {"type":"logement|parking|ignorer","raison_ignorer":null,"titre":"string","quartier":"string","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
 
   try {
@@ -285,6 +297,7 @@ const GEO = {
   'petit-saconnex': { lat: 46.2282, lng: 6.1382 }, 'grand-saconnex': { lat: 46.2382, lng: 6.1182 },
   'geneve': { lat: 46.2044, lng: 6.1432 },
 };
+
 function geocode(q) {
   if (!q) return { lat: 46.2044 + (Math.random()-.5)*.04, lng: 6.1432 + (Math.random()-.5)*.06 };
   const key = q.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -322,16 +335,25 @@ async function runCycle() {
   for (const source of CONFIG.sources) {
     log(`  → ${source.name} (${source.pages.length} page(s))`);
 
-    for (const pageUrl of source.pages) {
+    for (let pi = 0; pi < source.pages.length; pi++) {
+      const pageUrl = source.pages[pi];
       let blocks = [];
-      try {
-        if (source.type === 'anibis') blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor);
-        else if (source.type === 'immoscout') blocks = await scrapeImmoScout(listPage, pageUrl, source.waitFor);
-        else blocks = await scrapeGeneric(listPage, pageUrl, source.waitFor);
-        log(`    ${blocks.length} blocs page ${source.pages.indexOf(pageUrl) + 1}`);
-      } catch (e) { log(`    ✗ ${e.message}`); continue; }
 
-      await sleep(rand(2000, 4000));
+      try {
+        if (source.type === 'anibis') {
+          blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        } else if (source.type === 'immoscout') {
+          blocks = await scrapeImmoScout(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        } else {
+          blocks = await scrapeGeneric(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        }
+        log(`    ${blocks.length} blocs page ${pi + 1}`);
+      } catch (e) {
+        log(`    ✗ page ${pi + 1}: ${e.message.substring(0, 80)}`);
+        continue;
+      }
+
+      await sleep(rand(2000, 3500));
 
       for (const block of blocks) {
         const itemId = Buffer.from((block.link || block.text || '').substring(0, 120)).toString('base64').substring(0, 32);
@@ -341,14 +363,14 @@ async function runCycle() {
         let text = block.text;
         let photo = block.img;
 
-        // Enrichir si texte trop court ou pour ImmoScout (toujours enrichir)
-        if ((text.length < 100 || source.type === 'immoscout') && block.link) {
+        // Enrichir si texte court ou ImmoScout
+        if ((text.length < 100 || source.type === 'immoscout') && block.link?.startsWith('http')) {
           const detail = await enrichDetail(detailPage, block.link);
           if (detail) {
             if (detail.text.length > text.length) text = detail.text;
             if (!photo && detail.img) photo = detail.img;
           }
-          await sleep(rand(600, 1200));
+          await sleep(rand(500, 1000));
         }
 
         await sleep(rand(300, 600));
@@ -400,8 +422,8 @@ async function runCycle() {
 }
 
 async function main() {
-  log('NextCasa Bot v6 · Anibis · ImmoScout24 · PetitesAnnonces · Rentola');
-  log(`1h/jour (${CONFIG.schedule.dayStart}h-${CONFIG.schedule.dayEnd}h) · 2h/nuit · ${CONFIG.maxAgeDays}j filtre`);
+  log('NextCasa Bot v7 · Anibis · ImmoScout24 · PetitesAnnonces · Rentola');
+  log(`1h/jour · 2h/nuit`);
   while (true) {
     try { await runCycle(); } catch (e) { log(`✗ ${e.message}`); }
     const i = getNextInterval();
