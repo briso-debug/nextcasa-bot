@@ -1,7 +1,6 @@
 /**
- * bot.mjs — NextCasa v12
- * Fix: enrichDetail retire nav/header/footer avant extraction
- * Fix: itemId inclut texte pour éviter collisions Rentola
+ * bot.mjs — NextCasa v13
+ * Fix: confiance min = 0, itemId unique avec index, visite pages annonces
  */
 
 import { chromium } from 'playwright';
@@ -14,13 +13,11 @@ import 'dotenv/config';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CONFIG = {
-  maxPerPage: 25,
+  maxPerPage: 20,
   sources: [
     {
       id: 'anibis', name: 'Anibis.ch', type: 'anibis',
-      pages: [
-        'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZalhcGFydG1lbnSSqXByaWNlVHlwZaRSRU5UwMCRk6hsb2NhdGlvbrFnZW8tY2FudG9uLWdlbmV2ZcA',
-      ],
+      pages: ['https://www.anibis.ch/fr/q/immobilier-geneve-appartements-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZalhcGFydG1lbnSSqXByaWNlVHlwZaRSRU5UwMCRk6hsb2NhdGlvbrFnZW8tY2FudG9uLWdlbmV2ZcA'],
       waitFor: 8000,
     },
     {
@@ -43,7 +40,6 @@ const CONFIG = {
     dayInterval: 60 * 60 * 1000,
     nightInterval: 2 * 60 * 60 * 1000,
   },
-  minConfidence: 30,
   expiryDays: 14,
   dataFile: path.join(__dirname, 'data', 'listings.json'),
   seenFile: path.join(__dirname, 'data', 'seen.json'),
@@ -81,14 +77,8 @@ function isDuplicate(listing, existing) {
   });
 }
 
-// itemId basé sur lien + début de texte pour éviter collisions
-function makeItemId(link, text) {
-  const key = (link || '') + '|' + (text || '').substring(0, 60);
-  return Buffer.from(key).toString('base64').substring(0, 32);
-}
-
 async function acceptCookies(page) {
-  for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', 'button:has-text("Accepter")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]']) {
+  for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]']) {
     try { await page.click(sel, { timeout: 2000 }); await sleep(500); break; } catch {}
   }
 }
@@ -96,8 +86,39 @@ async function scrollPage(page, n) {
   for (let i = 0; i < n; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(rand(700, 1100)); }
 }
 
-// ── ANIBIS : récupère les liens d'annonces ────────────────────────────
-async function scrapeAnibis(page, url, waitFor, maxPerPage) {
+// ── ENRICHISSEMENT : supprime nav puis extrait contenu ────────────────
+async function enrichDetail(page, url) {
+  if (!url?.startsWith('http')) return null;
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await sleep(rand(1200, 2000));
+    // Supprimer navigation
+    await page.evaluate(() => {
+      ['nav', 'header', 'footer', '[class*="nav"]', '[class*="header"]', '[class*="footer"]',
+       '[class*="cookie"]', '[class*="menu"]', '[class*="sidebar"]'].forEach(sel => {
+        try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch {}
+      });
+    });
+    const text = await page.evaluate(() => {
+      const candidates = ['[class*="detail"]', '[class*="description"]', '[class*="content"]',
+        '[class*="annonce"]', '[class*="listing"]', 'main', 'article', '#main'];
+      for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText?.trim().length > 100) return el.innerText.trim().substring(0, 1500);
+      }
+      return document.body.innerText?.trim().substring(0, 1500) || '';
+    });
+    const img = await page.evaluate(() => {
+      const imgs = Array.from(document.querySelectorAll('img[src*="http"]'))
+        .filter(i => (i.width > 200 || i.naturalWidth > 200) && !i.src.includes('logo') && !i.src.includes('icon'));
+      return imgs[0]?.src || '';
+    });
+    return { text, img };
+  } catch { return null; }
+}
+
+// ── ANIBIS ────────────────────────────────────────────────────────────
+async function scrapeAnibis(page, url, waitFor) {
   try {
     await page.goto('https://www.anibis.ch/fr/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     await sleep(rand(1500, 2500));
@@ -117,180 +138,114 @@ async function scrapeAnibis(page, url, waitFor, maxPerPage) {
       .map(a => a.href)
       .filter(h => { if (seen.has(h)) return false; seen.add(h); return true; })
       .slice(0, max);
-  }, maxPerPage);
+  }, CONFIG.maxPerPage);
 
-  log(`    ${links.length} liens annonces Anibis`);
-  return links.map(link => ({ text: '', link, img: '', needsEnrich: true }));
+  log(`    ${links.length} liens Anibis`);
+  // Chaque lien = un bloc à enrichir
+  return links.map((link, i) => ({ text: '', link, img: '', id: `anibis_${i}_${link.split('/').pop()}` }));
 }
 
-// ── RENTOLA ───────────────────────────────────────────────────────────
-async function scrapeRentola(page, url, waitFor, maxPerPage) {
+// ── RENTOLA : extrait les liens d'annonces individuelles ──────────────
+async function scrapeRentola(page, url, waitFor) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
   await acceptCookies(page);
   await scrollPage(page, 3);
 
-  const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
+  const info = await page.evaluate(() => ({ title: document.title.substring(0, 50), len: document.body.innerText.length }));
   log(`    ${info.title} · ${info.len}c`);
 
-  const items = await page.evaluate((max) => {
-    const results = [];
+  // Extraire les URLs d'annonces Rentola (on visitera chaque page)
+  const links = await page.evaluate((max) => {
     const seen = new Set();
-
-    // Chercher les liens vers annonces individuelles Rentola
-    const adLinks = Array.from(document.querySelectorAll('a[href]'))
+    return Array.from(document.querySelectorAll('a[href]'))
       .filter(a => {
         const h = a.href || '';
-        return h.includes('rentola.ch') && h.includes('/a-louer/') && h.split('/').length > 6;
-      });
+        // Lien annonce Rentola = contient /a-louer/ et un slug long
+        return h.includes('rentola.ch') && h.includes('/a-louer/') &&
+               h.length > 50 && h.split('/').length >= 7;
+      })
+      .map(a => a.href)
+      .filter(h => { if (seen.has(h)) return false; seen.add(h); return true; })
+      .slice(0, max);
+  }, CONFIG.maxPerPage);
 
-    if (adLinks.length > 0) {
-      adLinks.forEach(a => {
-        if (seen.has(a.href)) return;
-        seen.add(a.href);
-        let el = a;
-        for (let i = 0; i < 6; i++) {
-          const p = el.parentElement;
-          if (!p || p === document.body) break;
-          if (p.innerText?.includes('CHF') && p.innerText?.length < 5000) { el = p; break; }
-          el = p;
-        }
-        const text = el.innerText?.trim() || '';
-        const isNav = text.includes('Voir sur la carte') || text.includes('Type de propriété') || text.length < 50;
-        if (!isNav && results.length < max) {
-          results.push({ text: text.substring(0, 700), link: a.href, img: el.querySelector('img[src*="http"]')?.src || '' });
-        }
-      });
-    }
+  log(`    ${links.length} liens Rentola`);
+  if (links.length === 0) {
+    // Debug: afficher des samples de liens trouvés
+    const sample = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href*="rentola"]')).slice(0, 5).map(a => a.href)
+    );
+    if (sample.length) log(`    Sample liens: ${sample.slice(0, 3).join(' | ')}`);
+  }
 
-    // Fallback: blocs avec prix
-    if (results.length === 0) {
-      const blocks = document.body.innerText.split('\n\n')
-        .filter(b => {
-          const t = b.trim();
-          return t.length > 80 && t.includes('CHF') && (t.includes('/mois') || t.match(/\d[,.]?\d?\s*p[iè]/i));
-        });
-      blocks.slice(0, max).forEach((b, i) => results.push({ text: b.trim().substring(0, 600), link: '', img: '', _idx: i }));
-    }
-    return results;
-  }, maxPerPage);
-
-  log(`    ${items.length} items`);
-  return items;
+  return links.map((link, i) => ({ text: '', link, img: '', id: `rentola_${i}_${link.split('/').pop()}` }));
 }
 
 // ── PETITES ANNONCES ──────────────────────────────────────────────────
-async function scrapePetitesAnnonces(page, url, waitFor, maxPerPage) {
+async function scrapePetitesAnnonces(page, url, waitFor) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
 
-  const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
+  const info = await page.evaluate(() => ({ title: document.title.substring(0, 50), len: document.body.innerText.length }));
   log(`    ${info.title} · ${info.len}c`);
 
-  const items = await page.evaluate((max) => {
-    const results = [];
+  const links = await page.evaluate((max) => {
     const seen = new Set();
-    const junkWords = ["S'inscrire", 'petites annonces gratuites', 'Toute reproduction', 'Toutes les rubriques', 'Recherche avancée'];
-
-    // Liens vers annonces individuelles
-    const adLinks = Array.from(document.querySelectorAll('a[href]'))
+    // Liens vers annonces individuelles PetitesAnnonces
+    return Array.from(document.querySelectorAll('a[href]'))
       .filter(a => {
         const h = a.href || '';
-        return h.includes('petitesannonces.ch') && (h.match(/\/a\/\d+/) || h.match(/\/\d{5,}/));
-      });
+        return h.includes('petitesannonces.ch') && (
+          h.match(/\/a\/\d+/) || h.match(/petitesannonces\.ch\/[^/]+\/[^/]+\/\d+/)
+        );
+      })
+      .map(a => a.href)
+      .filter(h => { if (seen.has(h)) return false; seen.add(h); return true; })
+      .slice(0, max);
+  }, CONFIG.maxPerPage);
 
-    adLinks.forEach(a => {
-      if (seen.has(a.href)) return;
-      seen.add(a.href);
-      let el = a;
-      for (let i = 0; i < 5; i++) {
-        const p = el.parentElement;
-        if (!p || p === document.body) break;
-        if (p.innerText?.length > 50 && p.innerText?.length < 2000) el = p;
-        else break;
-      }
-      const text = el.innerText?.trim() || '';
-      const isJunk = junkWords.some(w => text.includes(w));
-      if (!isJunk && text.length > 30 && results.length < max) {
-        results.push({ text: text.substring(0, 600), link: a.href, img: el.querySelector('img[src*="http"]')?.src || '' });
-      }
-    });
+  log(`    ${links.length} liens PetitesAnnonces`);
 
-    // Fallback: lignes tableau avec prix
-    if (results.length === 0) {
-      Array.from(document.querySelectorAll('tr, li')).forEach(row => {
-        const text = row.innerText?.trim() || '';
-        const link = row.querySelector('a[href]')?.href || '';
-        if (text.length > 40 && text.length < 800 && (text.includes('CHF') || text.includes('.-')) && !junkWords.some(w => text.includes(w))) {
-          if (seen.has(link) && link) return;
-          if (link) seen.add(link);
-          if (results.length < max) results.push({ text: text.substring(0, 500), link, img: '' });
+  if (links.length === 0) {
+    // Fallback: extraire les blocs de texte avec prix directement de la page liste
+    const blocks = await page.evaluate((max) => {
+      const results = [];
+      const seen = new Set();
+      Array.from(document.querySelectorAll('tr, li, [class*="result"], [class*="ad"]')).forEach((el, i) => {
+        const text = el.innerText?.trim() || '';
+        const link = el.querySelector('a[href]')?.href || '';
+        if (text.length > 40 && text.length < 1000 &&
+            (text.includes('CHF') || text.includes('.-')) &&
+            !text.includes("S'inscrire") && !text.includes('Toute reproduction') &&
+            !text.includes('Toutes les rubriques')) {
+          const key = link || `block_${i}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          if (results.length < max) results.push({ text: text.substring(0, 600), link, img: '', id: `pa_${i}` });
         }
       });
-    }
-
-    return results;
-  }, maxPerPage);
-
-  log(`    ${items.length} items`);
-  return items;
-}
-
-// ── ENRICHISSEMENT INTELLIGENT ────────────────────────────────────────
-// Retire nav/header/footer puis extrait le texte principal
-async function enrichDetail(page, url) {
-  if (!url?.startsWith('http')) return null;
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await sleep(rand(1200, 2000));
-    await page.evaluate(() => {
-      // Supprimer les éléments de navigation avant extraction
-      const remove = ['nav', 'header', 'footer', '[class*="nav"]', '[class*="header"]',
-        '[class*="footer"]', '[class*="cookie"]', '[class*="banner"]', '[class*="menu"]',
-        '[class*="sidebar"]', '[id*="nav"]', '[id*="header"]', '[id*="footer"]'];
-      remove.forEach(sel => {
-        try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch {}
-      });
-    });
-
-    const text = await page.evaluate(() => {
-      // Chercher le bloc principal de contenu
-      const candidates = [
-        '[class*="detail"]', '[class*="description"]', '[class*="listing"]',
-        '[class*="content"]', '[class*="annonce"]', '[class*="ad-"]',
-        'main', 'article', '#main', '#content',
-      ];
-      for (const sel of candidates) {
-        const el = document.querySelector(sel);
-        if (el && el.innerText?.trim().length > 100) {
-          return el.innerText.trim().substring(0, 1500);
-        }
-      }
-      // Fallback: tout le body après nettoyage
-      return document.body.innerText?.trim().substring(0, 1500) || '';
-    });
-
-    const img = await page.evaluate(() => {
-      const imgs = Array.from(document.querySelectorAll('img[src*="http"]'))
-        .filter(i => (i.width > 200 || i.naturalWidth > 200) &&
-          !i.src.includes('logo') && !i.src.includes('icon') && !i.src.includes('avatar'));
-      return imgs[0]?.src || '';
-    });
-
-    return { text, img };
-  } catch (e) {
-    return null;
+      return results;
+    }, CONFIG.maxPerPage);
+    log(`    ${blocks.length} blocs fallback`);
+    return blocks;
   }
+
+  return links.map((link, i) => ({ text: '', link, img: '', id: `pa_${i}_${link.split('/').pop()}` }));
 }
 
 // ── LLM ───────────────────────────────────────────────────────────────
 async function extractWithLLM(text, sourceName) {
   const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').substring(0, 800);
-  const prompt = `Extracteur annonces immobilières Genève. Source: ${sourceName}
+  const prompt = `Tu extrais des données d'annonces immobilières pour la région genevoise.
+Source: ${sourceName}
 Texte: ${clean}
 
-ACCEPTE: offre de location (appartement, studio, maison, parking) dans canton Genève ou communes proches. Inclus reprises de bail.
-IGNORE uniquement: vente, cherche à louer (pas une offre), hors région genevoise, texte de navigation/aide/footer.
+Règles:
+- ACCEPTE toute offre de location dans canton Genève ou communes proches (Carouge, Lancy, Meyrin, Onex, Vernier, Bernex, Thônex, Plan-les-Ouates, etc.)
+- ACCEPTE reprises de bail, sous-locations longue durée
+- IGNORE uniquement: vente, offre hors Suisse romande, texte qui n'est pas une annonce (navigation, aide)
+- Si une info manque, mets null
 
 Réponds sur UNE SEULE LIGNE JSON:
 {"type":"logement|parking|ignorer","raison_ignorer":null,"titre":"string","quartier":"string","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
@@ -338,7 +293,7 @@ async function runCycle() {
 
   const listings = loadJSON(CONFIG.dataFile, []);
   const seenIds = new Set(loadJSON(CONFIG.seenFile, []));
-  let newCount = 0, dupCount = 0, ignoredCount = 0, lowConfCount = 0, expiredCount = 0;
+  let newCount = 0, dupCount = 0, ignoredCount = 0, expiredCount = 0;
 
   for (const l of listings) {
     if (l.status === 'active' && isExpired(l)) { l.status = 'expired'; expiredCount++; }
@@ -361,17 +316,16 @@ async function runCycle() {
   const detailPage = await context.newPage();
 
   for (const source of CONFIG.sources) {
-    log(`  → ${source.name} (${source.pages.length} page(s))`);
+    log(`  → ${source.name}`);
 
     for (let pi = 0; pi < source.pages.length; pi++) {
       const pageUrl = source.pages[pi];
       let blocks = [];
 
       try {
-        if (source.type === 'anibis') blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        else if (source.type === 'rentola') blocks = await scrapeRentola(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        else if (source.type === 'petitesannonces') blocks = await scrapePetitesAnnonces(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        log(`    ${blocks.length} blocs page ${pi + 1}`);
+        if (source.type === 'anibis') blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor);
+        else if (source.type === 'rentola') blocks = await scrapeRentola(listPage, pageUrl, source.waitFor);
+        else blocks = await scrapePetitesAnnonces(listPage, pageUrl, source.waitFor);
       } catch (e) {
         log(`    ✗ ${e.message.substring(0, 80)}`);
         continue;
@@ -380,17 +334,18 @@ async function runCycle() {
       await sleep(rand(1500, 3000));
 
       for (const block of blocks) {
-        // itemId = lien + début texte pour éviter collisions
-        const itemId = makeItemId(block.link, block.text);
+        // ID unique : priorité au champ id explicite, sinon lien, sinon lien+texte
+        const rawId = block.id || block.link || (block.link + '|' + (block.text || '').substring(0, 40));
+        const itemId = Buffer.from(rawId).toString('base64').substring(0, 32);
         if (seenIds.has(itemId)) continue;
         seenIds.add(itemId);
 
-        let text = block.text;
-        let photo = block.img;
+        let text = block.text || '';
+        let photo = block.img || '';
 
-        // Enrichir si demandé (Anibis) ou texte trop court
-        const shouldEnrich = block.needsEnrich || text.length < 200;
-        if (shouldEnrich && block.link?.startsWith('http')) {
+        // Visiter la page détail si pas de texte ou texte court
+        if (text.length < 150 && block.link?.startsWith('http')) {
+          log(`    ↗ Visite: ${block.link.substring(0, 60)}`);
           const detail = await enrichDetail(detailPage, block.link);
           if (detail) {
             if (detail.text.length > text.length) text = detail.text;
@@ -399,18 +354,18 @@ async function runCycle() {
           await sleep(rand(500, 1000));
         }
 
-        if (text.length < 30) continue;
+        if (text.length < 30) { log(`    → texte trop court, skip`); continue; }
 
         log(`    LLM ← "${text.substring(0, 80).replace(/\n/g, ' ')}…"`);
-
         await sleep(rand(200, 400));
         const ex = await extractWithLLM(text, source.name);
         if (!ex) continue;
-
         log(`    LLM → ${ex.type} · ${ex.confiance}% · CHF ${ex.prix} · ${ex.quartier}`);
 
         if (ex.type === 'ignorer') { ignoredCount++; continue; }
-        if (ex.confiance < CONFIG.minConfidence) { lowConfCount++; continue; }
+        // Accepter si c'est clairement un logement/parking même avec confiance faible
+        // Rejeter seulement si confiance = 0 ET pas de prix ET pas de quartier
+        if (ex.confiance === 0 && !ex.prix && !ex.quartier) { ignoredCount++; continue; }
 
         const coords = geocode(ex.quartier);
         const listing = {
@@ -420,8 +375,7 @@ async function runCycle() {
           quartier: ex.quartier || 'Genève', pieces: ex.pieces, prix: ex.prix,
           cc: ex.charges === 'incluses', charges: ex.charges,
           dispo: ex.dispo || null, details: ex.details || [],
-          desc: text.substring(0, 500),
-          photos: photo ? [photo] : [],
+          desc: text.substring(0, 500), photos: photo ? [photo] : [],
           sourceUrl: block.link || pageUrl,
           sourceName: source.name, sourceId: source.id,
           lat: coords.lat, lng: coords.lng, confiance: ex.confiance,
@@ -430,10 +384,10 @@ async function runCycle() {
           ageHours: 0,
         };
 
-        if (isDuplicate(listing, listings)) { dupCount++; continue; }
+        if (isDuplicate(listing, listings)) { dupCount++; log(`    ≈ doublon`); continue; }
         listings.push(listing);
         newCount++;
-        log(`    ✓ ${listing.title} · CHF ${listing.prix || '?'}`);
+        log(`    ✓ SAUVÉ: ${listing.title} · CHF ${listing.prix || '?'}`);
       }
     }
   }
@@ -448,12 +402,11 @@ async function runCycle() {
   saveJSON(CONFIG.seenFile, [...seenIds].slice(-30000));
 
   const actives = listings.filter(l => l.status === 'active').length;
-  log(`+${newCount} · ${dupCount} dup · ${ignoredCount} ignorées · ${lowConfCount} conf< · ${expiredCount} exp · ${actives} actives · ${Math.round((Date.now() - start) / 1000)}s`);
+  log(`+${newCount} · ${dupCount} dup · ${ignoredCount} ignorées · ${expiredCount} exp · ${actives} actives · ${Math.round((Date.now() - start) / 1000)}s`);
 }
 
 async function main() {
-  log('NextCasa Bot v12 · Anibis · Rentola · PetitesAnnonces');
-  log(`1h/jour · 2h/nuit · confiance: ${CONFIG.minConfidence}%`);
+  log('NextCasa Bot v13 · Anibis · Rentola · PetitesAnnonces');
   while (true) {
     try { await runCycle(); } catch (e) { log(`✗ ${e.message}`); }
     const i = getNextInterval();
