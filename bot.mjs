@@ -247,8 +247,7 @@ async function scrapeRentola(page, url, waitFor, maxPerPage) {
 
     // Fallback: blocs texte brut
     if (results.length === 0) {
-      const blocks = document.body.innerText.split(/
-{2,}/).filter(b => b.trim().length > 80 && b.includes('CHF'));
+      const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 80 && b.includes('CHF'));
       blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
     }
 
