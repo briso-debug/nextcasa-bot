@@ -136,14 +136,16 @@ async function scrapeAnibis(page, url, waitFor, maxPerPage) {
     const results = [];
     const seen = new Set();
 
-    // Chercher les liens /vi/ (annonces individuelles Anibis)
-    let links = Array.from(document.querySelectorAll('a[href*="/vi/"]'));
-
-    // Fallback: chercher liens avec numéros d'annonces
+    // Uniquement vrais liens annonces anibis.ch (pas anibis.help)
+    let links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
+      const h = a.href || '';
+      return h.includes('anibis.ch') && h.includes('/vi/');
+    });
+    // Fallback: IDs numériques
     if (links.length === 0) {
       links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
         const h = a.href || '';
-        return h.includes('anibis') && h.match(/\/\d{6,}/);
+        return h.includes('anibis.ch') && h.match(/\/\d{6,}/);
       });
     }
 
@@ -221,42 +223,35 @@ async function scrapeRentola(page, url, waitFor, maxPerPage) {
     const results = [];
     const seen = new Set();
 
-    // Rentola: chercher les cards d'annonces
-    const selectors = [
-      '[class*="listing"]', '[class*="property"]', '[class*="card"]',
-      '[class*="result"]', 'article', '[data-testid*="listing"]',
-    ];
-
-    let cards = [];
-    for (const sel of selectors) {
-      cards = Array.from(document.querySelectorAll(sel))
-        .filter(el => el.innerText?.length > 60 && el.innerText?.length < 3000);
-      if (cards.length > 2) break;
-    }
-
-    if (cards.length > 0) {
-      cards.slice(0, max).forEach(card => {
-        const link = card.querySelector('a[href]')?.href || '';
-        if (seen.has(link) && link) return;
-        if (link) seen.add(link);
-        const text = card.innerText?.trim() || '';
-        const img = card.querySelector('img[src*="http"]')?.src || '';
-        if (text.length > 60) results.push({ text: text.substring(0, 700), link, img });
+    // Rentola: chercher liens vers annonces individuelles
+    const adLinks = Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => {
+        const h = a.href || '';
+        return h.includes('rentola') && h.match(/\/[a-z0-9-]{10,}/);
       });
-    } else {
-      // Fallback: liens directs vers annonces
-      const links = Array.from(document.querySelectorAll('a[href*="/a-louer/"], a[href*="/location/"], a[href*="/appartement/"]'));
-      links.slice(0, max).forEach(a => {
+
+    if (adLinks.length > 0) {
+      adLinks.slice(0, max).forEach(a => {
         if (seen.has(a.href)) return; seen.add(a.href);
         let el = a;
-        for (let i = 0; i < 5; i++) {
-          if (el.parentElement?.innerText?.length > 60 && el.parentElement?.innerText?.length < 2000) el = el.parentElement;
+        for (let i = 0; i < 6; i++) {
+          const p = el.parentElement;
+          if (p && p.innerText?.length > 60 && p.innerText?.length < 5000) el = p;
           else break;
         }
-        const text = el.innerText?.trim() || '';
-        if (text.length > 60) results.push({ text: text.substring(0, 700), link: a.href, img: el.querySelector('img')?.src || '' });
+        const text = el.innerText?.trim() || a.innerText?.trim() || '';
+        const img = el.querySelector('img[src*="http"]')?.src || '';
+        if (text.length > 40) results.push({ text: text.substring(0, 700), link: a.href, img });
       });
     }
+
+    // Fallback: blocs texte brut
+    if (results.length === 0) {
+      const blocks = document.body.innerText.split(/
+{2,}/).filter(b => b.trim().length > 80 && b.includes('CHF'));
+      blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
+    }
+
     return results;
   }, maxPerPage);
 
