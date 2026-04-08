@@ -154,31 +154,54 @@ async function scrapeAnibis(page, url, waitFor, maxPerPage) {
       return results;
     }
 
+    // Debug: tailles des parents pour le premier lien
+    if (links.length > 0) {
+      const a0 = links[0];
+      const sizes = [];
+      let el0 = a0;
+      for (let i = 0; i < 8; i++) {
+        sizes.push(el0.innerText?.length || 0);
+        if (!el0.parentElement) break;
+        el0 = el0.parentElement;
+      }
+      window._anibisParentSizes = sizes.join(',');
+    }
+
     links.forEach(a => {
       const href = a.href || '';
       if (!href || seen.has(href)) return;
       seen.add(href);
 
+      // Remonter jusqu'au bon bloc : chercher le plus petit ancêtre
+      // qui contient au moins prix ET (quartier OU pièces)
+      let best = a;
       let el = a;
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 8; i++) {
         const p = el.parentElement;
-        if (p && p.innerText?.length > 60 && p.innerText?.length < 3000) el = p;
-        else break;
+        if (!p || p === document.body) break;
+        const t = p.innerText || '';
+        // Un bon bloc d'annonce contient CHF ou des pièces
+        if ((t.includes('CHF') || t.match(/\d[,.]?\d?\s*p[iè]/i)) && t.length < 15000) {
+          best = p;
+          break;
+        }
+        el = p;
       }
 
-      const text = el.innerText?.trim() || '';
-      const tl = text.toLowerCase();
-      const dm = tl.match(/(\d+)\s*(?:jour|day)/);
-      if (dm && parseInt(dm[1]) > 2) return;
+      const text = best.innerText?.trim() || a.innerText?.trim() || href;
+      const img = best.querySelector('img[src*="http"]')?.src || '';
 
-      const img = el.querySelector('img[src*="http"]')?.src || '';
-      if (text.length > 40 && results.length < max) {
-        results.push({ text: text.substring(0, 800), link: href, img });
+      if (results.length < max) {
+        results.push({ text: text.substring(0, 900), link: href, img });
       }
     });
 
     return results;
   }, maxPerPage);
+
+  // Log tailles parents pour diagnostic
+  const parentSizes = await page.evaluate(() => window._anibisParentSizes || '');
+  if (parentSizes) log(`    Parent sizes du 1er lien: ${parentSizes}`);
 
   log(`    ${items.length} items`);
   return items;
