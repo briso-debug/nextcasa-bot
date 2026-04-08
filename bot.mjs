@@ -1,6 +1,10 @@
 /**
- * bot.mjs — NextCasa v7
- * Corrections: networkidle→domcontentloaded, max passé correctement, ImmoScout robuste
+ * bot.mjs — NextCasa v8
+ * Fixes:
+ * - Anibis: URL simple + attente JS + sélecteur corrigé
+ * - ImmoScout: remplacé par homegate.ch (même groupe, moins bloqué)
+ * - LLM: prompt plus permissif, confiance abaissée
+ * - Rentola/PetitesAnnonces: sélecteurs améliorés
  */
 
 import { chromium } from 'playwright';
@@ -18,20 +22,20 @@ const CONFIG = {
     {
       id: 'anibis', name: 'Anibis.ch', type: 'anibis',
       pages: [
-        'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-maisons-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZZKpYXBhcnRtZW50pWhvdXNlkqlwcmljZVR5cGWkUkVOVMDAkZOobG9jYXRpb26xZ2VvLWNhbnRvbi1nZW5ldmXA?sorting=newest&page=1',
-        'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-maisons-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZZKpYXBhcnRtZW50pWhvdXNlkqlwcmljZVR5cGWkUkVOVMDAkZOobG9jYXRpb26xZ2VvLWNhbnRvbi1nZW5ldmXA?sorting=newest&page=2',
-        'https://www.anibis.ch/fr/q/immobilier-geneve-appartements-maisons-louer/Ak8CqcmVhbEVzdGF0ZZSSkqtsaXN0aW5nVHlwZZKpYXBhcnRtZW50pWhvdXNlkqlwcmljZVR5cGWkUkVOVMDAkZOobG9jYXRpb26xZ2VvLWNhbnRvbi1nZW5ldmXA?sorting=newest&page=3',
+        'https://www.anibis.ch/fr/c/immobilier-immobilier-locations/geneve?sorting=newest',
+        'https://www.anibis.ch/fr/c/immobilier-immobilier-locations/geneve?sorting=newest&page=2',
+        'https://www.anibis.ch/fr/c/immobilier-immobilier-locations/geneve?sorting=newest&page=3',
       ],
-      waitFor: 5000,
+      waitFor: 7000,
     },
     {
-      id: 'immoscout', name: 'ImmoScout24.ch', type: 'immoscout',
+      id: 'homegate', name: 'Homegate.ch', type: 'homegate',
       pages: [
-        'https://www.immoscout24.ch/fr/appartement/louer/canton-geneve',
-        'https://www.immoscout24.ch/fr/appartement/louer/canton-geneve?pn=2',
-        'https://www.immoscout24.ch/fr/appartement/louer/canton-geneve?pn=3',
+        'https://www.homegate.ch/louer/appartement/canton-geneve/liste?tri=publicationDate-desc',
+        'https://www.homegate.ch/louer/appartement/canton-geneve/liste?tri=publicationDate-desc&ep=2',
+        'https://www.homegate.ch/louer/appartement/canton-geneve/liste?tri=publicationDate-desc&ep=3',
       ],
-      waitFor: 8000,
+      waitFor: 5000,
     },
     {
       id: 'petitesannonces', name: 'PetitesAnnonces.ch', type: 'generic',
@@ -39,7 +43,7 @@ const CONFIG = {
       waitFor: 3000,
     },
     {
-      id: 'rentola', name: 'Rentola.ch', type: 'generic',
+      id: 'rentola', name: 'Rentola.ch', type: 'rentola',
       pages: [
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment',
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment&page=2',
@@ -48,12 +52,13 @@ const CONFIG = {
       waitFor: 4000,
     },
   ],
+
   schedule: {
     dayStart: 6, dayEnd: 24,
     dayInterval: 60 * 60 * 1000,
     nightInterval: 2 * 60 * 60 * 1000,
   },
-  minConfidence: 40,
+  minConfidence: 35,
   expiryDays: 14,
   dataFile: path.join(__dirname, 'data', 'listings.json'),
   seenFile: path.join(__dirname, 'data', 'seen.json'),
@@ -62,7 +67,7 @@ const CONFIG = {
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const rand = (min, max) => Math.floor(Math.random() * (max - min) + min);
+const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
 
 function loadJSON(f, fb) { try { if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf8')); } catch {} return fb; }
 function saveJSON(f, d) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
@@ -78,6 +83,7 @@ function isDay() {
 }
 function getNextInterval() { return isDay() ? CONFIG.schedule.dayInterval : CONFIG.schedule.nightInterval; }
 function isExpired(l) { return Date.now() - new Date(l.scrapedAt).getTime() > CONFIG.expiryDays * 86400000; }
+
 function isDuplicate(listing, existing) {
   return existing.some(e => {
     if (e.status !== 'active') return false;
@@ -92,52 +98,97 @@ function isDuplicate(listing, existing) {
 }
 
 async function acceptCookies(page) {
-  for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]']) {
+  for (const sel of [
+    'button:has-text("Tout accepter")', 'button:has-text("Accept all")',
+    'button:has-text("Accepter")', '#onetrust-accept-btn-handler',
+    '[data-cy*="accept"]', 'button[class*="accept"]',
+  ]) {
     try { await page.click(sel, { timeout: 2000 }); await sleep(500); break; } catch {}
   }
 }
 
-async function scroll(page, times) {
+async function scrollPage(page, times) {
   for (let i = 0; i < times; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight));
     await sleep(800);
   }
 }
 
-// ── ANIBIS ──────────────────────────────────────────────────────────
+// ── ANIBIS ───────────────────────────────────────────────────────────
 async function scrapeAnibis(page, url, waitFor, maxPerPage) {
-  // Utiliser domcontentloaded au lieu de networkidle pour éviter le timeout
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await sleep(waitFor);
   await acceptCookies(page);
-  await scroll(page, 4);
+  await scrollPage(page, 5);
+  // Attendre encore un peu après le scroll
+  await sleep(2000);
 
-  const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
-  log(`    ${info.title} · ${info.len} chars`);
+  const info = await page.evaluate(() => ({
+    title: document.title.substring(0, 70),
+    len: document.body.innerText.length,
+    // Debug: compter les liens /vi/
+    viLinks: document.querySelectorAll('a[href*="/vi/"]').length,
+    // Et aussi d'autres patterns
+    allLinks: document.querySelectorAll('a[href]').length,
+    // Sample des hrefs
+    sampleLinks: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(a => a.href).filter(h => h.includes('anibis')),
+  }));
+  log(`    ${info.title} · ${info.len}c · /vi/ links: ${info.viLinks} · total links: ${info.allLinks}`);
+  if (info.sampleLinks.length > 0) log(`    Sample: ${info.sampleLinks.slice(0, 3).join(' | ')}`);
 
-  // Extraire les blocs d'annonces via les liens /vi/
   const items = await page.evaluate((max) => {
     const results = [];
     const seen = new Set();
-    const links = Array.from(document.querySelectorAll('a[href*="/vi/"]'));
+
+    // Essayer /vi/ d'abord
+    let links = Array.from(document.querySelectorAll('a[href*="/vi/"]'));
+
+    // Si pas trouvé, chercher d'autres patterns anibis
+    if (links.length === 0) {
+      links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
+        const h = a.href || '';
+        return h.includes('anibis.ch') && (h.match(/\/\d{6,}/) || h.includes('/vi/') || h.includes('/annonce/'));
+      });
+    }
+
+    // Fallback: prendre tous les liens anibis qui ne sont pas navigation
+    if (links.length === 0) {
+      links = Array.from(document.querySelectorAll('a[href*="anibis.ch"]')).filter(a => {
+        const h = a.href || '';
+        return !h.includes('?') || h.includes('page=');
+      });
+    }
+
     links.forEach(a => {
-      if (seen.has(a.href) || !a.href) return;
-      seen.add(a.href);
+      const href = a.href || '';
+      if (!href || seen.has(href)) return;
+      seen.add(href);
+
       let el = a;
-      for (let i = 0; i < 5; i++) {
-        if (el.parentElement?.innerText?.length > 80 && el.parentElement?.innerText?.length < 2000) {
-          el = el.parentElement;
-        } else break;
+      for (let i = 0; i < 6; i++) {
+        const p = el.parentElement;
+        if (p && p.innerText?.length > 60 && p.innerText?.length < 3000) el = p;
+        else break;
       }
+
       const text = el.innerText?.trim() || '';
-      // Filtre 2 jours
-      const dayMatch = text.toLowerCase().match(/(\d+)\s*(?:jour|day)/);
+      const textL = text.toLowerCase();
+      const dayMatch = textL.match(/(\d+)\s*(?:jour|day)/);
       if (dayMatch && parseInt(dayMatch[1]) > 2) return;
+
       const img = el.querySelector('img[src*="http"]')?.src || '';
       if (text.length > 40 && results.length < max) {
-        results.push({ text: text.substring(0, 800), link: a.href, img });
+        results.push({ text: text.substring(0, 800), link: href, img });
       }
     });
+
+    // Si toujours rien, extraire le texte brut de la page
+    if (results.length === 0) {
+      const bodyText = document.body.innerText;
+      const blocks = bodyText.split(/\n{3,}/).filter(b => b.trim().length > 60 && b.trim().length < 2000);
+      blocks.slice(0, max).forEach(b => results.push({ text: b.trim(), link: '', img: '' }));
+    }
+
     return results;
   }, maxPerPage);
 
@@ -145,66 +196,104 @@ async function scrapeAnibis(page, url, waitFor, maxPerPage) {
   return items;
 }
 
-// ── IMMOSCOUT ────────────────────────────────────────────────────────
-// ImmoScout bloque le headless browser → on utilise une approche différente:
-// charger la page, attendre longuement, prendre tout le texte brut visible
-async function scrapeImmoScout(page, url, waitFor, maxPerPage) {
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
-  } catch (e) {
-    log(`    ⚠ Goto partiel: ${e.message.substring(0, 50)}`);
-  }
-
-  // Attendre très longuement + scroll pour forcer React
+// ── HOMEGATE ─────────────────────────────────────────────────────────
+async function scrapeHomegate(page, url, waitFor, maxPerPage) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await sleep(waitFor);
   await acceptCookies(page);
-  await scroll(page, 8);
-  await sleep(2000);
+  await scrollPage(page, 5);
+  await sleep(1500);
 
   const info = await page.evaluate(() => ({
-    title: document.title.substring(0, 60),
+    title: document.title.substring(0, 70),
     len: document.body.innerText.length,
-    html: document.body.innerHTML.length,
+    links: document.querySelectorAll('a[href*="/louer/"]').length,
   }));
-  log(`    ${info.title} · ${info.len} chars text · ${info.html} chars html`);
+  log(`    ${info.title} · ${info.len}c · louer links: ${info.links}`);
 
-  if (info.len < 200) {
-    log(`    ⚠ ImmoScout bloqué (page vide) — skip`);
-    return [];
-  }
-
-  // Extraire les annonces
   const items = await page.evaluate((max) => {
     const results = [];
     const seen = new Set();
 
-    // Chercher les liens avec des IDs d'annonces (chiffres longs)
-    const allLinks = Array.from(document.querySelectorAll('a[href]'));
-    const adLinks = allLinks.filter(a => {
+    // Homegate: liens vers annonces individuelles
+    const links = Array.from(document.querySelectorAll('a[href*="/louer/"]')).filter(a => {
       const h = a.href || '';
-      return h.includes('immoscout24') && h.match(/\/\d{7,}/) && !seen.has(h);
+      return h.match(/\/louer\/\w+\/\d+/) || h.match(/\/\d{8,}/);
     });
 
-    adLinks.slice(0, max).forEach(a => {
-      seen.add(a.href);
+    links.forEach(a => {
+      const href = a.href || '';
+      if (!href || seen.has(href)) return;
+      seen.add(href);
+
       let el = a;
       for (let i = 0; i < 6; i++) {
-        if (el.parentElement?.innerText?.length > 60 && el.parentElement?.innerText?.length < 3000) {
-          el = el.parentElement;
-        } else break;
+        const p = el.parentElement;
+        if (p && p.innerText?.length > 60 && p.innerText?.length < 3000) el = p;
+        else break;
       }
-      const text = el.innerText?.trim() || a.innerText?.trim() || '';
+
+      const text = el.innerText?.trim() || '';
       const img = el.querySelector('img[src*="http"]')?.src || '';
-      if (text.length > 20) results.push({ text: text.substring(0, 800), link: a.href, img });
+      if (text.length > 40 && results.length < max) {
+        results.push({ text: text.substring(0, 800), link: href, img });
+      }
     });
 
-    // Fallback si pas de liens trouvés: extraire le texte brut en blocs
+    // Fallback texte brut
     if (results.length === 0) {
-      const bodyText = document.body.innerText;
-      const blocks = bodyText.split(/\n{3,}/).filter(b => b.trim().length > 60);
-      blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
+      const blocks = document.body.innerText.split(/\n{3,}/).filter(b => b.trim().length > 60);
+      blocks.slice(0, max).forEach(b => results.push({ text: b.trim(), link: '', img: '' }));
     }
 
+    return results;
+  }, maxPerPage);
+
+  log(`    ${items.length} items`);
+  return items;
+}
+
+// ── RENTOLA ──────────────────────────────────────────────────────────
+async function scrapeRentola(page, url, waitFor, maxPerPage) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await sleep(waitFor);
+  await acceptCookies(page);
+  await scrollPage(page, 3);
+
+  const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
+  log(`    ${info.title} · ${info.len}c`);
+
+  const items = await page.evaluate((max) => {
+    const results = [];
+    const seen = new Set();
+
+    // Rentola: cards d'annonces
+    const cards = Array.from(document.querySelectorAll('[class*="listing"], [class*="property"], [class*="card"], article'))
+      .filter(el => el.innerText?.length > 50 && el.innerText?.length < 3000);
+
+    if (cards.length > 0) {
+      cards.slice(0, max).forEach(card => {
+        const link = card.querySelector('a[href]')?.href || '';
+        if (seen.has(link) && link) return;
+        if (link) seen.add(link);
+        const text = card.innerText?.trim() || '';
+        const img = card.querySelector('img[src*="http"]')?.src || '';
+        if (text.length > 50) results.push({ text: text.substring(0, 700), link, img });
+      });
+    } else {
+      // Fallback: liens
+      const links = Array.from(document.querySelectorAll('a[href*="/a-louer/"], a[href*="/location/"]'));
+      links.slice(0, max).forEach(a => {
+        if (seen.has(a.href)) return; seen.add(a.href);
+        let el = a;
+        for (let i = 0; i < 5; i++) {
+          if (el.parentElement?.innerText?.length > 60 && el.parentElement?.innerText?.length < 2000) el = el.parentElement;
+          else break;
+        }
+        const text = el.innerText?.trim() || '';
+        if (text.length > 50) results.push({ text: text.substring(0, 700), link: a.href, img: el.querySelector('img')?.src || '' });
+      });
+    }
     return results;
   }, maxPerPage);
 
@@ -217,22 +306,22 @@ async function scrapeGeneric(page, url, waitFor, maxPerPage) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
   await acceptCookies(page);
-  await scroll(page, 3);
+  await scrollPage(page, 2);
 
   const info = await page.evaluate(() => ({ title: document.title.substring(0, 60), len: document.body.innerText.length }));
-  log(`    ${info.title} · ${info.len} chars`);
+  log(`    ${info.title} · ${info.len}c`);
 
   const items = await page.evaluate((maxItems) => {
     const results = [];
-    const selectors = ['[class*="listing"]', '[class*="result"]', '[class*="card"]', '[class*="property"]', 'article', 'li[class]'];
+    const selectors = ['[class*="listing"]', '[class*="result"]', '[class*="card"]', '[class*="property"]', 'article', 'li[class]', 'tr[class]'];
     let cards = [];
     for (const sel of selectors) {
-      cards = Array.from(document.querySelectorAll(sel)).filter(el => el.innerText?.length > 40 && el.innerText?.length < 3000);
+      cards = Array.from(document.querySelectorAll(sel)).filter(el => el.innerText?.length > 50 && el.innerText?.length < 3000);
       if (cards.length > 3) break;
     }
 
     if (cards.length === 0) {
-      const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 40);
+      const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 50);
       blocks.slice(0, maxItems).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
       return results;
     }
@@ -244,7 +333,7 @@ async function scrapeGeneric(page, url, waitFor, maxPerPage) {
       if (link) seen.add(link);
       const text = card.innerText?.trim() || '';
       const img = card.querySelector('img[src*="http"]')?.src || '';
-      if (text.length > 40) results.push({ text: text.substring(0, 600), link, img });
+      if (text.length > 50) results.push({ text: text.substring(0, 600), link, img });
     });
     return results;
   }, maxPerPage);
@@ -259,9 +348,9 @@ async function enrichDetail(page, url) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await sleep(1500);
-    const text = await page.evaluate(() => document.body.innerText?.trim().substring(0, 1000) || '');
+    const text = await page.evaluate(() => document.body.innerText?.trim().substring(0, 1200) || '');
     const img = await page.evaluate(() => {
-      const imgs = Array.from(document.querySelectorAll('img[src*="http"]')).filter(i => i.width > 150);
+      const imgs = Array.from(document.querySelectorAll('img[src*="http"]')).filter(i => i.width > 150 || i.naturalWidth > 150);
       return imgs[0]?.src || '';
     });
     return { text, img };
@@ -270,15 +359,26 @@ async function enrichDetail(page, url) {
 
 // ── LLM ─────────────────────────────────────────────────────────────
 async function extractWithLLM(text, sourceName) {
-  const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').replace(/"/g, "'").substring(0, 500);
-  const prompt = `Extracteur annonces immobilières Genève. Source: ${sourceName}
-Texte: ${clean}
+  const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').replace(/\\/g, '/').substring(0, 600);
+  const prompt = `Tu es un extracteur d'annonces immobilières pour la région genevoise et romande.
+Source: ${sourceName}
+Texte brut: ${clean}
 
-Réponds en JSON une ligne. Si pas offre location canton GE → type ignorer.
-{"type":"logement|parking|ignorer","raison_ignorer":null,"titre":"string","quartier":"string","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
+Règles:
+- Si c'est une offre de location (appartement, maison, parking) dans le canton de Genève → extraire
+- Accepter même si l'info est incomplète (mettre null pour les champs manquants)
+- Ignorer uniquement si: vente, hors Suisse, cherche à louer (pas une offre)
+- Sous-location: ignorer SAUF si c'est une reprise de bail
+
+Réponds sur UNE SEULE LIGNE JSON:
+{"type":"logement|parking|ignorer","raison_ignorer":null,"titre":"Xp Quartier","quartier":"quartier GE","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
 
   try {
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 300, messages: [{ role: 'user', content: prompt }] });
+    const r = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
     const raw = r.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
     const line = raw.split('\n').find(l => l.trim().startsWith('{')) || raw;
     return JSON.parse(line);
@@ -295,6 +395,7 @@ const GEO = {
   'saint-gervais': { lat: 46.2072, lng: 6.1408 }, 'grottes': { lat: 46.2115, lng: 6.1358 },
   'charmilles': { lat: 46.2168, lng: 6.1248 }, 'chatelaine': { lat: 46.2172, lng: 6.1082 },
   'petit-saconnex': { lat: 46.2282, lng: 6.1382 }, 'grand-saconnex': { lat: 46.2382, lng: 6.1182 },
+  'acacias': { lat: 46.1935, lng: 6.1382 }, 'bachet': { lat: 46.1782, lng: 6.1282 },
   'geneve': { lat: 46.2044, lng: 6.1432 },
 };
 
@@ -340,20 +441,17 @@ async function runCycle() {
       let blocks = [];
 
       try {
-        if (source.type === 'anibis') {
-          blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        } else if (source.type === 'immoscout') {
-          blocks = await scrapeImmoScout(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        } else {
-          blocks = await scrapeGeneric(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
-        }
+        if (source.type === 'anibis') blocks = await scrapeAnibis(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        else if (source.type === 'homegate') blocks = await scrapeHomegate(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        else if (source.type === 'rentola') blocks = await scrapeRentola(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
+        else blocks = await scrapeGeneric(listPage, pageUrl, source.waitFor, CONFIG.maxPerPage);
         log(`    ${blocks.length} blocs page ${pi + 1}`);
       } catch (e) {
         log(`    ✗ page ${pi + 1}: ${e.message.substring(0, 80)}`);
         continue;
       }
 
-      await sleep(rand(2000, 3500));
+      await sleep(rand(2000, 4000));
 
       for (const block of blocks) {
         const itemId = Buffer.from((block.link || block.text || '').substring(0, 120)).toString('base64').substring(0, 32);
@@ -363,20 +461,24 @@ async function runCycle() {
         let text = block.text;
         let photo = block.img;
 
-        // Enrichir si texte court ou ImmoScout
-        if ((text.length < 100 || source.type === 'immoscout') && block.link?.startsWith('http')) {
+        // Enrichir si texte court et lien disponible
+        if (text.length < 120 && block.link?.startsWith('http')) {
           const detail = await enrichDetail(detailPage, block.link);
           if (detail) {
             if (detail.text.length > text.length) text = detail.text;
             if (!photo && detail.img) photo = detail.img;
           }
-          await sleep(rand(500, 1000));
+          await sleep(rand(400, 800));
         }
 
-        await sleep(rand(300, 600));
+        await sleep(rand(200, 500));
         const ex = await extractWithLLM(text, source.name);
-        if (!ex || ex.type === 'ignorer') { if (ex) ignoredCount++; continue; }
-        if (ex.confiance < CONFIG.minConfidence) continue;
+        if (!ex) continue;
+        if (ex.type === 'ignorer') { ignoredCount++; continue; }
+        if (ex.confiance < CONFIG.minConfidence) {
+          log(`    → faible confiance (${ex.confiance}%): ${text.substring(0, 40)}`);
+          continue;
+        }
 
         const coords = geocode(ex.quartier);
         const listing = {
@@ -422,12 +524,12 @@ async function runCycle() {
 }
 
 async function main() {
-  log('NextCasa Bot v7 · Anibis · ImmoScout24 · PetitesAnnonces · Rentola');
-  log(`1h/jour · 2h/nuit`);
+  log('NextCasa Bot v8 · Anibis · Homegate · PetitesAnnonces · Rentola');
+  log(`1h/jour · 2h/nuit · confiance min: ${CONFIG.minConfidence}%`);
   while (true) {
     try { await runCycle(); } catch (e) { log(`✗ ${e.message}`); }
     const i = getNextInterval();
-    log(`Prochain cycle dans ${Math.round(i/60000)} min…`);
+    log(`Prochain cycle dans ${Math.round(i / 60000)} min…`);
     await sleep(i);
   }
 }
