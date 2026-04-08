@@ -1,9 +1,7 @@
 /**
- * bot.mjs — NextCasa v9
- * Approche: URLs simples indexées par Google + stealth mode
- * Anibis fonctionne avec ses URLs de catégorie /c/ non /q/
- * Rentola fonctionne déjà
- * PetitesAnnonces fonctionne déjà
+ * bot.mjs — NextCasa v10
+ * Fix: Anibis filtre anibis.ch uniquement + log du texte LLM
+ * Fix: LLM plus permissif + log confiance
  */
 
 import { chromium } from 'playwright';
@@ -18,7 +16,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG = {
   maxPerPage: 25,
   sources: [
-    // Anibis avec URLs simples de catégorie (indexées par Google)
     {
       id: 'anibis', name: 'Anibis.ch', type: 'anibis',
       pages: [
@@ -26,7 +23,6 @@ const CONFIG = {
       ],
       waitFor: 8000,
     },
-    // Rentola fonctionne bien
     {
       id: 'rentola', name: 'Rentola.ch', type: 'rentola',
       pages: [
@@ -36,21 +32,18 @@ const CONFIG = {
       ],
       waitFor: 4000,
     },
-    // PetitesAnnonces fonctionne bien
     {
       id: 'petitesannonces', name: 'PetitesAnnonces.ch', type: 'generic',
       pages: ['https://www.petitesannonces.ch/r/270608?od=desc&ob=submissionDate'],
       waitFor: 3000,
     },
-
   ],
-
   schedule: {
     dayStart: 6, dayEnd: 24,
     dayInterval: 60 * 60 * 1000,
     nightInterval: 2 * 60 * 60 * 1000,
   },
-  minConfidence: 35,
+  minConfidence: 30,
   expiryDays: 14,
   dataFile: path.join(__dirname, 'data', 'listings.json'),
   seenFile: path.join(__dirname, 'data', 'seen.json'),
@@ -75,7 +68,6 @@ function isDay() {
 }
 function getNextInterval() { return isDay() ? CONFIG.schedule.dayInterval : CONFIG.schedule.nightInterval; }
 function isExpired(l) { return Date.now() - new Date(l.scrapedAt).getTime() > CONFIG.expiryDays * 86400000; }
-
 function isDuplicate(listing, existing) {
   return existing.some(e => {
     if (e.status !== 'active') return false;
@@ -90,25 +82,17 @@ function isDuplicate(listing, existing) {
 }
 
 async function acceptCookies(page) {
-  for (const sel of [
-    'button:has-text("Tout accepter")', 'button:has-text("Accept all")',
-    'button:has-text("Accepter")', '#onetrust-accept-btn-handler',
-    '[data-cy*="accept"]', 'button[class*="accept"]',
-  ]) {
+  for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', 'button:has-text("Accepter")', '#onetrust-accept-btn-handler', '[data-cy*="accept"]']) {
     try { await page.click(sel, { timeout: 2000 }); await sleep(500); break; } catch {}
   }
 }
-
-async function scrollPage(page, times) {
-  for (let i = 0; i < times; i++) {
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-    await sleep(rand(700, 1200));
-  }
+async function scrollPage(page, n) {
+  for (let i = 0; i < n; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(rand(700, 1100)); }
 }
 
-// ── ANIBIS avec stealth ───────────────────────────────────────────────
+// ── ANIBIS ───────────────────────────────────────────────────────────
 async function scrapeAnibis(page, url, waitFor, maxPerPage) {
-  // Simuler navigation humaine - d'abord aller sur la homepage
+  // Passer par la homepage pour simuler navigation humaine
   try {
     await page.goto('https://www.anibis.ch/fr/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     await sleep(rand(1500, 2500));
@@ -116,100 +100,70 @@ async function scrapeAnibis(page, url, waitFor, maxPerPage) {
     await sleep(rand(800, 1500));
   } catch {}
 
-  // Puis naviguer vers la page cible
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await sleep(waitFor);
   await scrollPage(page, 5);
   await sleep(2000);
 
   const info = await page.evaluate(() => ({
-    title: document.title.substring(0, 70),
+    title: document.title.substring(0, 60),
     len: document.body.innerText.length,
-    viLinks: document.querySelectorAll('a[href*="/vi/"]').length,
-    allLinks: document.querySelectorAll('a[href]').length,
-    sample: Array.from(document.querySelectorAll('a[href*="anibis"]')).slice(0, 5).map(a => a.href),
+    // Compter UNIQUEMENT les liens anibis.ch (pas anibis.help)
+    realAdLinks: Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => a.href.includes('anibis.ch') && a.href.includes('/vi/')).length,
+    allViLinks: document.querySelectorAll('a[href*="/vi/"]').length,
+    // Exemple de vrais liens annonces
+    sampleReal: Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => a.href.includes('anibis.ch') && a.href.includes('/vi/'))
+      .slice(0, 3).map(a => a.href),
   }));
-  log(`    "${info.title}" · ${info.len}c · /vi/: ${info.viLinks} · links: ${info.allLinks}`);
-  if (info.sample.length) log(`    Sample: ${info.sample.slice(0,3).join(' | ')}`);
+  log(`    "${info.title}" · ${info.len}c · annonces: ${info.realAdLinks} (total /vi/: ${info.allViLinks})`);
+  if (info.sampleReal.length) log(`    Vrais liens: ${info.sampleReal.join(' | ')}`);
+  else log(`    ⚠ Aucun vrai lien annonce anibis.ch/vi/ trouvé`);
 
   const items = await page.evaluate((max) => {
     const results = [];
     const seen = new Set();
 
-    // Uniquement vrais liens annonces anibis.ch (pas anibis.help)
-    let links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-      const h = a.href || '';
-      return h.includes('anibis.ch') && h.includes('/vi/');
-    });
-    // Fallback: IDs numériques
-    if (links.length === 0) {
-      links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
+    // UNIQUEMENT les liens anibis.ch/fr/vi/ — pas anibis.help
+    const links = Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => {
         const h = a.href || '';
-        return h.includes('anibis.ch') && h.match(/\/\d{6,}/);
+        return h.startsWith('https://www.anibis.ch') && h.includes('/vi/');
       });
-    }
-
-    // Fallback final: tous les blocs de texte substantiels
-    if (links.length === 0) {
-      const blocks = document.body.innerText.split(/\n{3,}/).filter(b => b.trim().length > 80);
-      blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 700), link: '', img: '' }));
-      return results;
-    }
-
-    // Debug: tailles des parents pour le premier lien
-    if (links.length > 0) {
-      const a0 = links[0];
-      const sizes = [];
-      let el0 = a0;
-      for (let i = 0; i < 8; i++) {
-        sizes.push(el0.innerText?.length || 0);
-        if (!el0.parentElement) break;
-        el0 = el0.parentElement;
-      }
-      window._anibisParentSizes = sizes.join(',');
-    }
 
     links.forEach(a => {
-      const href = a.href || '';
-      if (!href || seen.has(href)) return;
+      const href = a.href;
+      if (seen.has(href)) return;
       seen.add(href);
 
-      // Remonter jusqu'au bon bloc : chercher le plus petit ancêtre
-      // qui contient au moins prix ET (quartier OU pièces)
+      // Chercher le bloc parent contenant CHF (prix = indication d'annonce)
       let best = a;
       let el = a;
       for (let i = 0; i < 8; i++) {
         const p = el.parentElement;
         if (!p || p === document.body) break;
         const t = p.innerText || '';
-        // Un bon bloc d'annonce contient CHF ou des pièces
-        if ((t.includes('CHF') || t.match(/\d[,.]?\d?\s*p[iè]/i)) && t.length < 15000) {
+        if (t.includes('CHF') && t.length < 20000) {
           best = p;
           break;
         }
         el = p;
       }
 
-      const text = best.innerText?.trim() || a.innerText?.trim() || href;
+      const text = best.innerText?.trim() || a.innerText?.trim() || '';
       const img = best.querySelector('img[src*="http"]')?.src || '';
-
-      if (results.length < max) {
-        results.push({ text: text.substring(0, 900), link: href, img });
-      }
+      if (results.length < max) results.push({ text: text.substring(0, 900), link: href, img });
     });
 
     return results;
   }, maxPerPage);
 
-  // Log tailles parents pour diagnostic
-  const parentSizes = await page.evaluate(() => window._anibisParentSizes || '');
-  if (parentSizes) log(`    Parent sizes du 1er lien: ${parentSizes}`);
-
-  log(`    ${items.length} items`);
+  log(`    ${items.length} items extraits`);
   return items;
 }
 
-// ── RENTOLA ──────────────────────────────────────────────────────────
+// ── RENTOLA ───────────────────────────────────────────────────────────
 async function scrapeRentola(page, url, waitFor, maxPerPage) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
@@ -223,31 +177,30 @@ async function scrapeRentola(page, url, waitFor, maxPerPage) {
     const results = [];
     const seen = new Set();
 
-    // Rentola: chercher liens vers annonces individuelles
+    // Chercher liens vers annonces Rentola individuelles
     const adLinks = Array.from(document.querySelectorAll('a[href]'))
       .filter(a => {
         const h = a.href || '';
-        return h.includes('rentola') && h.match(/\/[a-z0-9-]{10,}/);
+        return h.includes('rentola.ch') && h.match(/\/[a-z0-9-]{15,}(\/)?$/);
       });
 
-    if (adLinks.length > 0) {
-      adLinks.slice(0, max).forEach(a => {
-        if (seen.has(a.href)) return; seen.add(a.href);
-        let el = a;
-        for (let i = 0; i < 6; i++) {
-          const p = el.parentElement;
-          if (p && p.innerText?.length > 60 && p.innerText?.length < 5000) el = p;
-          else break;
-        }
-        const text = el.innerText?.trim() || a.innerText?.trim() || '';
-        const img = el.querySelector('img[src*="http"]')?.src || '';
-        if (text.length > 40) results.push({ text: text.substring(0, 700), link: a.href, img });
-      });
-    }
+    adLinks.slice(0, max).forEach(a => {
+      if (seen.has(a.href)) return;
+      seen.add(a.href);
+      let el = a;
+      for (let i = 0; i < 6; i++) {
+        const p = el.parentElement;
+        if (p && p.innerText?.length > 60 && p.innerText?.length < 5000) el = p;
+        else break;
+      }
+      const text = el.innerText?.trim() || '';
+      const img = el.querySelector('img[src*="http"]')?.src || '';
+      if (text.length > 40) results.push({ text: text.substring(0, 700), link: a.href, img });
+    });
 
-    // Fallback: blocs texte brut
+    // Fallback: blocs de texte contenant CHF
     if (results.length === 0) {
-      const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 80 && b.includes('CHF'));
+      const blocks = document.body.innerText.split('\n\n').filter(b => b.trim().length > 80 && b.includes('CHF'));
       blocks.slice(0, max).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
     }
 
@@ -258,7 +211,7 @@ async function scrapeRentola(page, url, waitFor, maxPerPage) {
   return items;
 }
 
-// ── GÉNÉRIQUE ────────────────────────────────────────────────────────
+// ── GÉNÉRIQUE (PetitesAnnonces) ───────────────────────────────────────
 async function scrapeGeneric(page, url, waitFor, maxPerPage) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
@@ -276,13 +229,11 @@ async function scrapeGeneric(page, url, waitFor, maxPerPage) {
       cards = Array.from(document.querySelectorAll(sel)).filter(el => el.innerText?.length > 50 && el.innerText?.length < 3000);
       if (cards.length > 3) break;
     }
-
     if (cards.length === 0) {
-      const blocks = document.body.innerText.split(/\n{2,}/).filter(b => b.trim().length > 60);
+      const blocks = document.body.innerText.split('\n\n').filter(b => b.trim().length > 60);
       blocks.slice(0, maxItems).forEach(b => results.push({ text: b.trim().substring(0, 600), link: '', img: '' }));
       return results;
     }
-
     const seen = new Set();
     cards.slice(0, maxItems).forEach(card => {
       const link = card.querySelector('a[href]')?.href || '';
@@ -299,7 +250,7 @@ async function scrapeGeneric(page, url, waitFor, maxPerPage) {
   return items;
 }
 
-// ── ENRICHISSEMENT ───────────────────────────────────────────────────
+// ── ENRICHISSEMENT ────────────────────────────────────────────────────
 async function enrichDetail(page, url) {
   if (!url?.startsWith('http')) return null;
   try {
@@ -307,23 +258,23 @@ async function enrichDetail(page, url) {
     await sleep(1500);
     const text = await page.evaluate(() => document.body.innerText?.trim().substring(0, 1200) || '');
     const img = await page.evaluate(() => {
-      const imgs = Array.from(document.querySelectorAll('img[src*="http"]')).filter(i => i.width > 150 || i.naturalWidth > 150);
+      const imgs = Array.from(document.querySelectorAll('img[src*="http"]')).filter(i => i.width > 150);
       return imgs[0]?.src || '';
     });
     return { text, img };
   } catch { return null; }
 }
 
-// ── LLM ─────────────────────────────────────────────────────────────
+// ── LLM ──────────────────────────────────────────────────────────────
 async function extractWithLLM(text, sourceName) {
-  const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').replace(/\\/g, '/').substring(0, 600);
+  const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').substring(0, 600);
   const prompt = `Extracteur annonces immobilières Genève. Source: ${sourceName}
 Texte: ${clean}
 
-Accepte si: offre location appartement/maison/parking dans canton Genève ou communes proches (Carouge, Meyrin, Lancy, Onex, Vernier, etc.). Accepte reprises de bail.
-Ignore uniquement: vente, cherche à louer (pas offre), hors région genevoise.
+Accepte: toute offre de location (appartement, maison, parking, studio) dans le canton de Genève ou communes limitrophes (Carouge, Lancy, Meyrin, Onex, Vernier, Bernex, etc.). Accepte reprises de bail et sous-locations longue durée.
+Ignore SEULEMENT: vente immobilière, offre hors Suisse romande, demande de location (pas une offre).
 
-UNE SEULE LIGNE JSON:
+Réponds sur UNE SEULE LIGNE JSON valide:
 {"type":"logement|parking|ignorer","raison_ignorer":null,"titre":"string","quartier":"string","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
 
   try {
@@ -334,8 +285,12 @@ UNE SEULE LIGNE JSON:
     });
     const raw = r.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
     const line = raw.split('\n').find(l => l.trim().startsWith('{')) || raw;
-    return JSON.parse(line);
-  } catch (e) { log(`    ⚠ LLM: ${e.message}`); return null; }
+    const result = JSON.parse(line);
+    return result;
+  } catch (e) {
+    log(`    ⚠ LLM parse: ${e.message} | raw: ${e.message}`);
+    return null;
+  }
 }
 
 const GEO = {
@@ -348,19 +303,17 @@ const GEO = {
   'saint-gervais': { lat: 46.2072, lng: 6.1408 }, 'grottes': { lat: 46.2115, lng: 6.1358 },
   'charmilles': { lat: 46.2168, lng: 6.1248 }, 'chatelaine': { lat: 46.2172, lng: 6.1082 },
   'petit-saconnex': { lat: 46.2282, lng: 6.1382 }, 'grand-saconnex': { lat: 46.2382, lng: 6.1182 },
-  'acacias': { lat: 46.1935, lng: 6.1382 }, 'thonet': { lat: 46.1972, lng: 6.2012 },
-  'geneve': { lat: 46.2044, lng: 6.1432 },
+  'acacias': { lat: 46.1935, lng: 6.1382 }, 'geneve': { lat: 46.2044, lng: 6.1432 },
 };
-
 function geocode(q) {
-  if (!q) return { lat: 46.2044 + (Math.random()-.5)*.04, lng: 6.1432 + (Math.random()-.5)*.06 };
+  if (!q) return { lat: 46.2044 + (Math.random() - .5) * .04, lng: 6.1432 + (Math.random() - .5) * .06 };
   const key = q.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   const match = Object.entries(GEO).find(([k]) => key.includes(k));
-  if (match) return { lat: match[1].lat + (Math.random()-.5)*.003, lng: match[1].lng + (Math.random()-.5)*.005 };
-  return { lat: 46.2044 + (Math.random()-.5)*.04, lng: 6.1432 + (Math.random()-.5)*.06 };
+  if (match) return { lat: match[1].lat + (Math.random() - .5) * .003, lng: match[1].lng + (Math.random() - .5) * .005 };
+  return { lat: 46.2044 + (Math.random() - .5) * .04, lng: 6.1432 + (Math.random() - .5) * .06 };
 }
 
-// ── CYCLE ────────────────────────────────────────────────────────────
+// ── CYCLE ─────────────────────────────────────────────────────────────
 async function runCycle() {
   const start = Date.now();
   log('════════════════════════════');
@@ -368,7 +321,7 @@ async function runCycle() {
 
   const listings = loadJSON(CONFIG.dataFile, []);
   const seenIds = new Set(loadJSON(CONFIG.seenFile, []));
-  let newCount = 0, dupCount = 0, ignoredCount = 0, expiredCount = 0;
+  let newCount = 0, dupCount = 0, ignoredCount = 0, lowConfCount = 0, expiredCount = 0;
 
   for (const l of listings) {
     if (l.status === 'active' && isExpired(l)) { l.status = 'expired'; expiredCount++; }
@@ -376,26 +329,12 @@ async function runCycle() {
 
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--lang=fr-FR',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
-    ],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--lang=fr-FR', '--disable-blink-features=AutomationControlled'],
   });
-
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 },
-    locale: 'fr-FR',
-    timezoneId: 'Europe/Zurich',
-    extraHTTPHeaders: {
-      'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    },
+    viewport: { width: 1440, height: 900 }, locale: 'fr-FR', timezoneId: 'Europe/Zurich',
   });
-
-  // Masquer l'automatisation
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.chrome = { runtime: {} };
@@ -431,7 +370,8 @@ async function runCycle() {
         let text = block.text;
         let photo = block.img;
 
-        if (text.length < 120 && block.link?.startsWith('http')) {
+        // Enrichir si texte trop court
+        if (text.length < 100 && block.link?.startsWith('http')) {
           const detail = await enrichDetail(detailPage, block.link);
           if (detail) {
             if (detail.text.length > text.length) text = detail.text;
@@ -440,11 +380,17 @@ async function runCycle() {
           await sleep(rand(400, 800));
         }
 
+        // Log aperçu du texte envoyé au LLM
+        log(`    LLM ← "${text.substring(0, 80).replace(/\n/g, ' ')}…"`);
+
         await sleep(rand(200, 500));
         const ex = await extractWithLLM(text, source.name);
         if (!ex) continue;
+
+        log(`    LLM → type:${ex.type} conf:${ex.confiance}% prix:${ex.prix} q:${ex.quartier}`);
+
         if (ex.type === 'ignorer') { ignoredCount++; continue; }
-        if (ex.confiance < CONFIG.minConfidence) continue;
+        if (ex.confiance < CONFIG.minConfidence) { lowConfCount++; continue; }
 
         const coords = geocode(ex.quartier);
         const listing = {
@@ -455,8 +401,7 @@ async function runCycle() {
           quartier: ex.quartier || 'Genève',
           pieces: ex.pieces, prix: ex.prix,
           cc: ex.charges === 'incluses', charges: ex.charges,
-          dispo: ex.dispo || null,
-          details: ex.details || [],
+          dispo: ex.dispo || null, details: ex.details || [],
           desc: text.substring(0, 500),
           photos: photo ? [photo] : [],
           sourceUrl: block.link || pageUrl,
@@ -486,12 +431,12 @@ async function runCycle() {
   saveJSON(CONFIG.seenFile, [...seenIds].slice(-30000));
 
   const actives = listings.filter(l => l.status === 'active').length;
-  log(`+${newCount} · ${dupCount} doublons · ${ignoredCount} ignorées · ${expiredCount} exp. · ${actives} actives · ${Math.round((Date.now()-start)/1000)}s`);
+  log(`+${newCount} · ${dupCount} dup · ${ignoredCount} ignorées · ${lowConfCount} conf< · ${expiredCount} exp · ${actives} actives · ${Math.round((Date.now() - start) / 1000)}s`);
 }
 
 async function main() {
-  log('NextCasa Bot v9 · Anibis · Rentola · PetitesAnnonces');
-  log(`1h/jour · 2h/nuit · confiance: ${CONFIG.minConfidence}%`);
+  log('NextCasa Bot v10 · Anibis · Rentola · PetitesAnnonces');
+  log(`1h/jour · 2h/nuit · confiance min: ${CONFIG.minConfidence}%`);
   while (true) {
     try { await runCycle(); } catch (e) { log(`✗ ${e.message}`); }
     const i = getNextInterval();
