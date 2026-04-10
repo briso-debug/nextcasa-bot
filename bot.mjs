@@ -1,8 +1,7 @@
 /**
- * bot.mjs — NextCasa v14
- * Fix: PetitesAnnonces retire nav avant LLM
- * Fix: filtre France, échanges, chambres
- * Fix: meilleures photos
+ * bot.mjs — NextCasa v15
+ * Fix: Rentola filtre les vraies annonces (URLs avec ID numérique)
+ * Fix: PetitesAnnonces coupe la nav directement dans le texte
  */
 
 import { chromium } from 'playwright';
@@ -28,7 +27,7 @@ const CONFIG = {
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment',
         'https://rentola.ch/fr/a-louer?location=geneve-region&order=desc&property_types=apartment&page=2',
       ],
-      waitFor: 4000,
+      waitFor: 5000,
     },
     {
       id: 'petitesannonces', name: 'PetitesAnnonces.ch', type: 'petitesannonces',
@@ -78,11 +77,6 @@ function isDuplicate(listing, existing) {
   });
 }
 
-function makeItemId(link, text) {
-  const key = (link || '') + '|' + (text || '').substring(0, 60);
-  return Buffer.from(key).toString('base64').substring(0, 32);
-}
-
 async function acceptCookies(page) {
   for (const sel of ['button:has-text("Tout accepter")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler']) {
     try { await page.click(sel, { timeout: 2000 }); await sleep(500); break; } catch {}
@@ -92,6 +86,31 @@ async function scrollPage(page, n) {
   for (let i = 0; i < n; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(rand(700, 1000)); }
 }
 
+// ── NETTOYAGE TEXTE ────────────────────────────────
+function cleanText(text, source) {
+  let t = text || '';
+
+  if (source === 'petitesannonces') {
+    // Supprimer tout jusqu'après "Retour à la liste d'annonces"
+    const markers = ["Retour à la liste d'annonces", '« Retour à la liste', 'Retour à la liste'];
+    for (const marker of markers) {
+      const idx = t.indexOf(marker);
+      if (idx > 0) { t = t.substring(idx + marker.length).trim(); break; }
+    }
+    // Supprimer les patterns de nav restants
+    t = t.replace(/Toutes les rubriques[\s\S]{0,150}Recherche avancée/g, '');
+    t = t.replace(/« Précédent\s*Suivant »/g, '');
+    t = t.replace(/S'inscrire.*?Se connecter/gs, '');
+  }
+
+  // Supprimer le header Anibis
+  if (source === 'anibis') {
+    t = t.replace(/^Messages\s+Insérer annonce\s+Gratuit\s*/i, '');
+  }
+
+  return t.replace(/\s{3,}/g, '\n').trim().substring(0, 1200);
+}
+
 // ── ENRICHISSEMENT PAGE DÉTAIL ─────────────────────
 async function enrichDetail(page, url, source) {
   if (!url?.startsWith('http')) return null;
@@ -99,79 +118,28 @@ async function enrichDetail(page, url, source) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
     await sleep(rand(1200, 2000));
 
-    // Supprimer navigation/header/footer
-    await page.evaluate(() => {
-      ['nav', 'header', 'footer', '[class*="nav"]', '[class*="header"]', '[class*="footer"]',
-       '[class*="cookie"]', '[class*="menu"]', '[class*="breadcrumb"]', '[id*="nav"]',
-       '[id*="header"]', '[id*="footer"]', '.breadcrumb', '#breadcrumb'].forEach(sel => {
-        try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch {}
-      });
-    });
+    const rawText = await page.evaluate(() => document.body.innerText || '');
+    const text = rawText;
 
-    // Pour PetitesAnnonces: supprimer aussi les blocs de nav spécifiques
-    if (source === 'petitesannonces') {
-      await page.evaluate(() => {
-        // Supprimer "Toutes les rubriques", "Recherche avancée", "Retour à la liste"
-        document.querySelectorAll('a, div, p').forEach(el => {
-          const t = el.innerText?.trim() || '';
-          if (t === 'Toutes les rubriques' || t === 'Recherche avancée' ||
-              t.includes('Retour à la liste') || t.includes('Précédent') ||
-              t.includes('Suivant') || t.match(/^─+$/)) {
-            el.remove();
-          }
-        });
-      });
-    }
-
-    const text = await page.evaluate((src) => {
-      // Sélecteurs prioritaires par source
-      const selectors = src === 'petitesannonces'
-        ? ['#ad-detail', '.ad-detail', '[class*="detail"]', '[class*="annonce"]', 'main', '.content']
-        : ['[class*="detail"]', '[class*="description"]', '[class*="listing"]', 'main', 'article'];
-
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.innerText?.trim().length > 80) {
-          return el.innerText.trim().substring(0, 1500);
-        }
-      }
-      // Fallback body
-      const body = document.body.innerText?.trim() || '';
-      // Pour PetitesAnnonces, chercher après "Retour à la liste"
-      const idx = body.indexOf('Retour à la liste');
-      if (idx > 0 && src === 'petitesannonces') {
-        return body.substring(idx + 20).substring(0, 1500);
-      }
-      return body.substring(0, 1500);
-    }, source);
-
-    // Extraire photos — chercher les vraies images (pas icônes/logos)
     const img = await page.evaluate(() => {
       const selectors = [
-        'img[class*="photo"]', 'img[class*="image"]', 'img[class*="gallery"]',
-        '[class*="gallery"] img', '[class*="photo"] img', '[class*="slider"] img',
-        '.swiper-slide img', '.carousel img',
+        'img[class*="photo"]', 'img[class*="image-"]', 'img[class*="gallery"]',
+        '[class*="gallery"] img', '[class*="photo"] img',
+        '[class*="slider"] img', '.swiper-slide img',
+        '[class*="carousel"] img', '[class*="images"] img',
       ];
       for (const sel of selectors) {
         const el = document.querySelector(sel);
-        if (el?.src && el.src.startsWith('http') && !el.src.includes('logo') && !el.src.includes('icon')) {
-          return el.src;
-        }
+        if (el?.src?.startsWith('http') && !el.src.includes('logo') && !el.src.includes('icon')) return el.src;
       }
-      // Fallback: première grande image
       const imgs = Array.from(document.querySelectorAll('img[src*="http"]'))
-        .filter(i => {
-          const src = i.src || '';
-          return (i.naturalWidth > 300 || i.width > 200) &&
-            !src.includes('logo') && !src.includes('icon') &&
-            !src.includes('avatar') && !src.includes('sprite');
-        });
+        .filter(i => (i.naturalWidth > 300 || i.width > 200) &&
+          !i.src.includes('logo') && !i.src.includes('icon') && !i.src.includes('avatar'));
       return imgs[0]?.src || '';
     });
 
-    return { text, img };
+    return { text: cleanText(text, source), img };
   } catch (e) {
-    log(`    ✗ enrichDetail: ${e.message.substring(0, 60)}`);
     return null;
   }
 }
@@ -203,30 +171,64 @@ async function scrapeAnibis(page, url, waitFor) {
   return links.map((link, i) => ({ text: '', link, img: '', id: `anibis_${i}_${link.split('/').pop()}` }));
 }
 
-// ── RENTOLA ─────────────────────────────────────────
+// ── RENTOLA : seulement les vraies annonces ─────────
 async function scrapeRentola(page, url, waitFor) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(waitFor);
   await acceptCookies(page);
-  await scrollPage(page, 3);
+  await scrollPage(page, 4);
+  await sleep(1000);
 
   const info = await page.evaluate(() => ({ title: document.title.substring(0, 50), len: document.body.innerText.length }));
   log(`    ${info.title} · ${info.len}c`);
 
+  // Les vraies annonces Rentola ont une URL avec un slug unique long
+  // Ex: /fr/a-louer/appartement/carouge/appartement-3p-carouge-1234567
+  // Les pages de filtres ont: /geneve-region/neuf, /1-chambre, /lausanne, /berne
   const links = await page.evaluate((max) => {
     const seen = new Set();
+    const FILTER_PATTERNS = [
+      '/neuf', '/meuble', '/avec-ascenseur', '/avec-balcon', '/avec-terrasse',
+      '/avec-jardin', '/avec-garage', '/avec-parking', '/1-chambre', '/2-chambre',
+      '/3-chambre', '/4-chambre', '/5-chambre', '/maison', '/studio',
+      '/lausanne', '/berne', '/zurich', '/basel',
+      'geneve-region', // page de résultats globale
+    ];
+
     return Array.from(document.querySelectorAll('a[href]'))
       .filter(a => {
         const h = a.href || '';
-        return h.includes('rentola.ch') && h.includes('/a-louer/') && h.split('/').length >= 7;
+        if (!h.includes('rentola.ch')) return false;
+        if (!h.includes('/a-louer/')) return false;
+        // Doit avoir au moins 6 segments de path
+        const parts = new URL(h).pathname.split('/').filter(Boolean);
+        if (parts.length < 5) return false;
+        // Ne doit pas être une page de filtres
+        if (FILTER_PATTERNS.some(p => h.includes(p))) return false;
+        // Le dernier segment doit ressembler à un slug d'annonce (contient des chiffres ou est long)
+        const lastPart = parts[parts.length - 1];
+        if (lastPart.length < 10) return false;
+        return true;
       })
       .map(a => a.href)
       .filter(h => { if (seen.has(h)) return false; seen.add(h); return true; })
       .slice(0, max);
   }, CONFIG.maxPerPage);
 
-  log(`    ${links.length} liens Rentola`);
-  return links.map((link, i) => ({ text: '', link, img: '', id: `rentola_${i}_${link.split('/').pop()}` }));
+  log(`    ${links.length} vraies annonces Rentola (sur page)`);
+
+  // Debug: afficher les URLs trouvées
+  if (links.length > 0) log(`    Sample: ${links[0].substring(0, 80)}`);
+  else {
+    // Fallback: afficher tous les liens /a-louer/ pour debug
+    const allLinks = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href*="/a-louer/"]'))
+        .slice(0, 5).map(a => a.href)
+    );
+    log(`    Debug liens /a-louer/: ${allLinks.join(' | ').substring(0, 200)}`);
+  }
+
+  return links.map((link, i) => ({ text: '', link, img: '', id: `rentola_${i}_${link.split('/').pop().substring(0,20)}` }));
 }
 
 // ── PETITES ANNONCES ────────────────────────────────
@@ -255,20 +257,21 @@ async function scrapePetitesAnnonces(page, url, waitFor) {
 
 // ── LLM ────────────────────────────────────────────
 async function extractWithLLM(text, sourceName) {
-  const clean = text.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
-    // Supprimer les patterns de navigation typiques
-    .replace(/Toutes les rubriques[\s\S]{0,200}Recherche avancée/g, '')
-    .replace(/« Retour à la liste d'annonces/g, '')
-    .replace(/« Précédent\s*Suivant »/g, '')
-    .substring(0, 900);
+  const clean = text.substring(0, 900);
 
   const prompt = `Tu extrais des données d'annonces immobilières pour la région genevoise.
 Source: ${sourceName}
 Texte: ${clean}
 
 RÈGLES STRICTES:
-ACCEPTE: appartements et logements à LOUER dans le canton de Genève (1200-1299) ou communes limitrophes suisses (Carouge, Lancy, Meyrin, Vernier, Onex, Thônex, Bernex, Veyrier, etc.)
-IGNORE si: vente, cherche à louer (pas une offre), texte de navigation/aide, échange d'appartement, chambre seule à louer dans colocation, hors Suisse (France, Haute-Savoie, Ain, Annemasse, Saint-Julien, etc.)
+ACCEPTE: appartements entiers à LOUER dans le canton de Genève ou communes suisses proches (Carouge, Lancy, Meyrin, Vernier, Onex, Thônex, Bernex, Veyrier, Versoix, Plan-les-Ouates)
+IGNORE si:
+- Vente (pas location)
+- Cherche à louer (pas une offre)
+- Échange d'appartement
+- Chambre seule en colocation
+- Hors Suisse (France, Haute-Savoie, Ain, Annemasse, Saint-Julien, Ferney-Voltaire)
+- Texte de navigation ou d'interface (pas une annonce)
 
 Réponds sur UNE SEULE LIGNE JSON:
 {"type":"logement|ignorer","raison_ignorer":null,"titre":"string","quartier":"string","pieces":null,"prix":null,"charges":"incluses|non incluses|inconnues","dispo":"string","details":[],"confiance":0}`;
@@ -295,10 +298,10 @@ const GEO = {
   'meyrin': { lat: 46.2332, lng: 6.0798 }, 'lancy': { lat: 46.1758, lng: 6.1195 },
   'vernier': { lat: 46.2198, lng: 6.0932 }, 'onex': { lat: 46.1832, lng: 6.1072 },
   'bernex': { lat: 46.1702, lng: 6.0982 }, 'paquis': { lat: 46.2105, lng: 6.1468 },
-  'saint-gervais': { lat: 46.2072, lng: 6.1408 }, 'charmilles': { lat: 46.2168, lng: 6.1248 },
-  'petit-saconnex': { lat: 46.2282, lng: 6.1382 }, 'grand-saconnex': { lat: 46.2382, lng: 6.1182 },
-  'acacias': { lat: 46.1935, lng: 6.1382 }, 'thonet': { lat: 46.1882, lng: 6.1948 },
-  'veyrier': { lat: 46.1482, lng: 6.1862 }, 'geneve': { lat: 46.2044, lng: 6.1432 },
+  'charmilles': { lat: 46.2168, lng: 6.1248 }, 'petit-saconnex': { lat: 46.2282, lng: 6.1382 },
+  'grand-saconnex': { lat: 46.2382, lng: 6.1182 }, 'acacias': { lat: 46.1935, lng: 6.1382 },
+  'thonet': { lat: 46.1882, lng: 6.1948 }, 'veyrier': { lat: 46.1482, lng: 6.1862 },
+  'geneve': { lat: 46.2044, lng: 6.1432 },
 };
 
 function geocode(q) {
@@ -358,7 +361,7 @@ async function runCycle() {
       await sleep(rand(1500, 3000));
 
       for (const block of blocks) {
-        const rawId = block.id || block.link || (block.link + '|' + (block.text || '').substring(0, 40));
+        const rawId = block.id || block.link;
         const itemId = Buffer.from(rawId).toString('base64').substring(0, 32);
         if (seenIds.has(itemId)) continue;
         seenIds.add(itemId);
@@ -376,7 +379,10 @@ async function runCycle() {
           await sleep(rand(500, 1000));
         }
 
-        if (text.length < 30) continue;
+        // Nettoyer le texte
+        text = cleanText(text, source.type);
+
+        if (text.length < 30) { log(`    → texte trop court après nettoyage`); continue; }
 
         log(`    LLM ← "${text.substring(0, 80).replace(/\n/g, ' ')}…"`);
         await sleep(rand(200, 400));
@@ -428,7 +434,7 @@ async function runCycle() {
 }
 
 async function main() {
-  log('NextCasa Bot v14 · Anibis · Rentola · PetitesAnnonces');
+  log('NextCasa Bot v15 · Anibis · Rentola · PetitesAnnonces');
   while (true) {
     try { await runCycle(); } catch (e) { log(`✗ ${e.message}`); }
     const i = getNextInterval();
