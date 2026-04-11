@@ -1,5 +1,5 @@
 /**
- * bot.mjs — NextCasa v15
+ * bot.mjs — NextCasa v16
  * Fix: Rentola filtre les vraies annonces (URLs avec ID numérique)
  * Fix: PetitesAnnonces coupe la nav directement dans le texte
  */
