@@ -40,7 +40,7 @@ const CONFIG = {
     dayInterval: 60 * 60 * 1000,
     nightInterval: 2 * 60 * 60 * 1000,
   },
-  expiryDays: 14,
+  expiryDays: 5,
   dataFile: path.join(__dirname, 'data', 'listings.json'),
   seenFile: path.join(__dirname, 'data', 'seen.json'),
   logFile: path.join(__dirname, 'data', 'bot.log'),
@@ -64,6 +64,21 @@ function isDay() {
 }
 function getNextInterval() { return isDay() ? CONFIG.schedule.dayInterval : CONFIG.schedule.nightInterval; }
 function isExpired(l) { return Date.now() - new Date(l.scrapedAt).getTime() > CONFIG.expiryDays * 86400000; }
+// Vérifier si une annonce Anibis est encore en ligne
+async function isStillOnline(page, url) {
+  if (!url || !url.includes('anibis.ch')) return true; // On ne vérifie que Anibis
+  try {
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    if (!response) return false;
+    const status = response.status();
+    if (status === 404 || status === 410) return false;
+    // Vérifier si la page contient "annonce introuvable" ou "n'existe plus"
+    const text = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
+    const notFound = text.match(/introuvable|n.existe plus|expired|not found|supprim/i);
+    return !notFound;
+  } catch { return true; } // En cas d'erreur, on garde l'annonce
+}
+
 function isDuplicate(listing, existing) {
   return existing.some(e => {
     if (e.status !== 'active') return false;
@@ -324,6 +339,24 @@ async function runCycle() {
 
   for (const l of listings) {
     if (l.status === 'active' && isExpired(l)) { l.status = 'expired'; expiredCount++; }
+  }
+
+  // Vérifier les annonces actives Anibis (max 10 par cycle pour ne pas ralentir)
+  const toCheck = listings.filter(l => l.status === 'active' && l.sourceId === 'anibis' && l.sourceUrl).slice(0, 10);
+  if (toCheck.length > 0) {
+    log(`  → Vérification de ${toCheck.length} annonces Anibis…`);
+    const checkBrowser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const checkPage = await checkBrowser.newPage();
+    for (const l of toCheck) {
+      const online = await isStillOnline(checkPage, l.sourceUrl);
+      if (!online) {
+        l.status = 'expired';
+        expiredCount++;
+        log(`    ✗ Expirée: ${l.title}`);
+      }
+      await sleep(500);
+    }
+    await checkBrowser.close();
   }
 
   const browser = await chromium.launch({
