@@ -306,6 +306,23 @@ Réponds sur UNE SEULE LIGNE JSON:
   }
 }
 
+// Géocodage Nominatim - coordonnées précises depuis l'adresse
+async function geocodeWithNominatim(address, quartier) {
+  const query = address || (quartier + ', Genève, Suisse');
+  try {
+    const url = 'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(query) + '&format=json&limit=1&countrycodes=ch';
+    const res = await fetch(url, { headers: { 'User-Agent': 'NextCasa/1.0' } });
+    const data = await res.json();
+    if (data && data[0]) {
+      return {
+        lat: parseFloat(data[0].lat) + (Math.random()-.5)*.0003,
+        lng: parseFloat(data[0].lon) + (Math.random()-.5)*.0003,
+      };
+    }
+  } catch {}
+  return null;
+}
+
 const GEO = {
   'carouge': { lat: 46.1848, lng: 6.1425 }, 'plainpalais': { lat: 46.1965, lng: 6.1412 },
   'jonction': { lat: 46.2002, lng: 6.1302 }, 'eaux-vives': { lat: 46.2018, lng: 6.1625 },
@@ -427,7 +444,10 @@ async function runCycle() {
         if (ex.type === 'ignorer') { ignoredCount++; continue; }
         if (ex.confiance === 0 && !ex.prix && !ex.quartier) { ignoredCount++; continue; }
 
-        const coords = geocode(ex.quartier);
+        // Géocodage: essayer Nominatim d'abord, fallback sur dictionnaire
+        let coords = await geocodeWithNominatim(null, ex.quartier);
+        if (!coords) coords = geocode(ex.quartier);
+        await sleep(1100); // Respecter le rate limit Nominatim (1 req/sec)
         const listing = {
           id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
           sourceItemId: itemId, status: 'active', type: ex.type,
