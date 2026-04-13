@@ -353,6 +353,7 @@ async function runCycle() {
   const listings = loadJSON(CONFIG.dataFile, []);
   const seenIds = new Set(loadJSON(CONFIG.seenFile, []));
   let newCount = 0, dupCount = 0, ignoredCount = 0, expiredCount = 0;
+  const newListingsForAlerts = [];
 
   for (const l of listings) {
     if (l.status === 'active' && isExpired(l)) { l.status = 'expired'; expiredCount++; }
@@ -467,6 +468,7 @@ async function runCycle() {
 
         if (isDuplicate(listing, listings)) { dupCount++; log(`    ≈ doublon`); continue; }
         listings.push(listing);
+        newListingsForAlerts.push(listing);
         newCount++;
         log(`    ✓ SAUVÉ: ${listing.title} · CHF ${listing.prix || '?'}`);
       }
@@ -484,6 +486,18 @@ async function runCycle() {
 
   const actives = listings.filter(l => l.status === 'active').length;
   log(`+${newCount} · ${dupCount} dup · ${ignoredCount} ignorées · ${expiredCount} exp · ${actives} actives · ${Math.round((Date.now() - start) / 1000)}s`);
+
+  // Notifier les alertes si nouvelles annonces
+  if (newCount > 0 && newListingsForAlerts.length > 0) {
+    try {
+      const r = await fetch('http://localhost:3001/check-alerts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newListings: newListingsForAlerts }),
+      });
+      log(`  → Alertes vérifiées (${newListingsForAlerts.length} nouvelles)`);
+    } catch(e) { log(`  ⚠ Check-alerts: ${e.message}`); }
+  }
 }
 
 async function main() {
